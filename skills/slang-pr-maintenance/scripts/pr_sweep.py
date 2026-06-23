@@ -106,12 +106,6 @@ def _ensure_assignee(d: Decision, pr: PR) -> None:
 # even if the Decision is a no-op), or None to defer to the next correction /
 # the normal lifecycle. `_CORRECTIONS` is consulted in order.
 
-def _correct_off_board(pr: PR, cfg: Config) -> Decision | None:
-    if pr.project_item_id is None:
-        return Decision(pr=pr, add_to_project=True)
-    return None
-
-
 def _correct_terminal_state(pr: PR, cfg: Config) -> Decision | None:
     # Defensive: the sweep only lists open PRs, so board automation normally
     # handles this already.
@@ -133,16 +127,25 @@ def _correct_misplaced_draft(pr: PR, cfg: Config) -> Decision | None:
     return d
 
 
+def _ci_blocks_human(pr: PR) -> bool:
+    """A non-bot PR with failing CI is not "ready for a human" (Todo) and belongs
+    in Revising. Bot PRs are owner-shepherded and exempt. This is the shared
+    predicate behind both _correct_failing_ci and the Done-bounce below, so a PR
+    pushed out of Done with red CI settles in Revising in a single sweep instead
+    of flip-flopping Todo<->Revising across runs."""
+    return not pr.is_bot and pr.ci_state == CI_FAILED
+
+
 def _correct_done_status(pr: PR, cfg: Config) -> Decision | None:
     # An open PR in Done is fine only while in the merge queue; if it was bumped
     # out (or the repo has no queue) bounce it back — Revising on changes
-    # requested, else Todo (ready for a human again).
+    # requested or failing CI, else Todo (ready for a human again).
     if pr.board_status != cfg.status_done:
         return None
     d = Decision(pr=pr)
     if pr.in_merge_queue:
         return d
-    if pr.review_decision == "CHANGES_REQUESTED":
+    if pr.review_decision == "CHANGES_REQUESTED" or _ci_blocks_human(pr):
         d.set_status = cfg.status_revising
     else:
         d.set_status = cfg.status_todo
@@ -153,8 +156,7 @@ def _correct_done_status(pr: PR, cfg: Config) -> Decision | None:
 def _correct_failing_ci(pr: PR, cfg: Config) -> Decision | None:
     # Bot PRs are owner-shepherded and may sit in Todo while iterating, so they
     # are not bounced here — that would oscillate against promotion.
-    if (not pr.is_bot and pr.board_status in (cfg.status_todo, cfg.status_inprogress)
-            and pr.ci_state == CI_FAILED):
+    if pr.board_status in (cfg.status_todo, cfg.status_inprogress) and _ci_blocks_human(pr):
         return Decision(pr=pr, set_status=cfg.status_revising)
     return None
 
@@ -169,7 +171,6 @@ def _correct_orphan_in_progress(pr: PR, cfg: Config) -> Decision | None:
 
 
 _CORRECTIONS: list[Callable[[PR, Config], Decision | None]] = [
-    _correct_off_board,
     _correct_terminal_state,
     _correct_misplaced_draft,
     _correct_done_status,
@@ -215,15 +216,28 @@ def _normal_lifecycle(pr: PR, cfg: Config) -> Decision:
     return d
 
 
-def reconcile(pr: PR, cfg: Config) -> Decision:
-    """Compute the single board transition this PR warrants. Idempotent: never
-    proposes a write whose effect is already present. Board-vs-reality
-    corrections take precedence over the normal lifecycle."""
+def _reconcile_status(pr: PR, cfg: Config) -> Decision:
+    """The status/assignee decision proper: board-vs-reality corrections take
+    precedence over the normal lifecycle."""
     for correction in _CORRECTIONS:
         d = correction(pr, cfg)
         if d is not None:
             return d
     return _normal_lifecycle(pr, cfg)
+
+
+def reconcile(pr: PR, cfg: Config) -> Decision:
+    """Compute the single board transition this PR warrants. Idempotent: never
+    proposes a write whose effect is already present.
+
+    A PR not yet on the board is added *and* gets its initial status/assignee
+    (and, via _plan_item, its Source) in the same pass: the apply step captures
+    the freshly created item id, so there is no need to wait a run for the board
+    item to exist before its fields can be set."""
+    d = _reconcile_status(pr, cfg)
+    if pr.project_item_id is None:
+        d.add_to_project = True
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +393,14 @@ class Applier:
           }
         }
         """
-        self.gh.graphql(mutation, {"project": self.cfg.project_id, "content": pr.node_id})
+        data = self.gh.graphql(mutation, {"project": self.cfg.project_id, "content": pr.node_id})
+        # Capture the new item id so the same apply pass can set its fields
+        # (Source/Status/...) — otherwise those writes hit the "not on board"
+        # guard and are deferred a whole run.
+        item_id = ((((data or {}).get("data") or {}).get("addProjectV2ItemById") or {})
+                   .get("item") or {}).get("id")
+        if item_id:
+            pr.project_item_id = item_id
 
     def set_status(self, pr: PR, status: str) -> None:
         self._set_single_select(pr, self.cfg.status_field, status)
@@ -472,7 +493,9 @@ def _plan_item(pr: PR, decision: Decision) -> dict[str, Any] | None:
     actions: dict[str, Any] = {}
     if decision.add_to_project:
         actions["add_to_project"] = True
-    if pr.source_unset and pr.project_item_id:
+    # Emit the Source backfill whenever it is unset; apply orders add_to_project
+    # first and captures the new item id, so a just-added PR can still be set.
+    if pr.source_unset:
         actions["set_source"] = pr.source
     if decision.set_status:
         actions["set_status"] = decision.set_status

@@ -193,6 +193,26 @@ class TestReconcile(unittest.TestCase):
         self.assertTrue(d.add_to_project)
         self.assertFalse(d.is_noop())
 
+    def test_off_board_pr_added_and_promoted_same_pass(self):
+        # A new (off-board) PR with green CI is added AND gets its initial status
+        # in one pass, not one run late.
+        pr = make_pr(author="alice", project_item_id=None, assignees=["bob"],
+                     ci_state=common.CI_PASSED, board_status=None)
+        d = sweep.reconcile(pr, self.cfg)
+        self.assertTrue(d.add_to_project)
+        self.assertEqual(d.set_status, "Todo")
+
+    def test_off_board_plan_item_carries_source(self):
+        # The plan for an off-board PR includes the Source backfill even though
+        # it has no project_item_id yet (apply captures the new id first).
+        pr = make_pr(author="alice", project_item_id=None, source="Internal",
+                     ci_state=common.CI_PASSED, assignees=["bob"], board_status=None)
+        pr.source_unset = True
+        item = sweep._plan_item(pr, sweep.reconcile(pr, self.cfg))
+        assert item is not None
+        self.assertTrue(item["add_to_project"])
+        self.assertEqual(item["set_source"], "Internal")
+
     def test_human_draft_in_todo_moves_to_revising(self):
         pr = make_pr(author="alice", is_draft=True, board_status="Todo")
         self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
@@ -217,6 +237,27 @@ class TestReconcile(unittest.TestCase):
         pr = make_pr(author="alice", board_status="Done", in_merge_queue=False,
                      review_decision="CHANGES_REQUESTED")
         self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
+
+    def test_open_done_failing_ci_settles_in_revising(self):
+        # Bounced out of Done with red CI: settle directly in Revising (not Todo,
+        # which _correct_failing_ci would just undo next sweep). No assignee set.
+        pr = make_pr(author="alice", board_status="Done", in_merge_queue=False,
+                     review_decision="REVIEW_REQUIRED", ci_state=common.CI_FAILED,
+                     assignee_pick="bob")
+        d = sweep.reconcile(pr, self.cfg)
+        self.assertEqual(d.set_status, "Revising")
+        self.assertIsNone(d.set_assignee)
+
+    def test_open_done_bot_failing_ci_still_to_todo(self):
+        # Bots are owner-shepherded and exempt from the CI bounce, so a bot PR
+        # bumped out of Done still promotes to Todo despite red CI.
+        pr = make_pr(author="nv-slang-bot", is_bot=True, source="Bot",
+                     board_status="Done", in_merge_queue=False,
+                     review_decision="REVIEW_REQUIRED", ci_state=common.CI_FAILED,
+                     assignee_pick="bob")
+        d = sweep.reconcile(pr, self.cfg)
+        self.assertEqual(d.set_status, "Todo")
+        self.assertEqual(d.set_assignee, "bob")
 
     def test_todo_failing_ci_back_to_revising(self):
         pr = make_pr(author="alice", assignees=["bob"], board_status="Todo",
@@ -258,6 +299,14 @@ class TestApplyDecisions(unittest.TestCase):
             self.assertTrue(gh.run_calls > 0)
             with open(state_path) as f:
                 self.assertEqual(json.load(f), doc["state"])  # state persisted
+
+    def test_add_to_project_captures_new_item_id(self):
+        # add_to_project must store the freshly created item id on the PR so the
+        # same apply pass can set its project fields.
+        applier = sweep.Applier(_ApplyGh(), make_cfg())
+        pr = common.PR(repo="o/r", number=1, node_id="PR_node", project_item_id=None)
+        applier.add_to_project(pr)
+        self.assertEqual(pr.project_item_id, "NEW_ITEM")
 
     def test_apply_decisions_no_state_writes_no_file(self):
         doc = {"plan": [{"repo": "o/r", "number": 1, "item_id": "I", "set_status": "Todo"}]}
@@ -526,6 +575,8 @@ class _ApplyGh:
 
     def graphql(self, query, variables=None):
         self.graphql_calls += 1
+        if "addProjectV2ItemById" in query:
+            return {"data": {"addProjectV2ItemById": {"item": {"id": "NEW_ITEM"}}}}
         return {}
 
     def api(self, path, jq=None, paginate=False):
