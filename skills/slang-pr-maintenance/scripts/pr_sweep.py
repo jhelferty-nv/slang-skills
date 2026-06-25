@@ -18,17 +18,23 @@ Portable: depends only on an authenticated `gh` (and, optionally, a local git
 checkout as a fast path). All org and infra constants are defaults in
 pr_common.py with shader-slang values.
 
-State machine (board Status field):
-    Revising -> Todo -> In Progress -> Done
-  - Revising: waiting on CI / a bot / a bot reviewer, before human involvement.
-  - Todo:     ready for a human (assignee set); appears in the reviewer inbox.
-  - InProgress: human-set on review start (this script never sets it).
-  - Done:     merged or closed (usually board automation; ensured here).
+State machine (board Status field), two variants differing ONLY on a CI failure:
+    In Review -> Revising / Snagged / Approved -> Done
+  - In Review: default for an open PR (awaiting review / CI pending / a fresh
+               commit); a Bot draft lands here so a human owner can shepherd it.
+  - Revising:  a human draft, or a reviewer requested changes; a Bot PR's CI
+               failure also lands here (the bot fixes itself).
+  - Snagged:   needs a human - a human PR's CI failed, or an approved PR has green
+               CI but is not in the merge queue (a human must enqueue/merge it).
+  - Approved:  not a draft, already approved, waiting on CI / the merge queue.
+  - Done:      the PR is closed (merged or otherwise); terminal.
 
-Pure decision functions (reconcile, the predicate ladders) take plain data and
-are covered by test_pr_sweep.py with no live `gh` calls. The committer-signal
-ranking lives in the pr_signal module; the shared collection / I/O lives in
-pr_common.
+The lifecycle stage is computed by `target_status` in pr_common (the single
+source of truth, shared with the board-free report and kept identical to
+computeTarget in .github/workflows/pr-board-sync.yml). `reconcile` corrects the
+board toward it. Pure decision functions are covered by test_pr_sweep.py with no
+live `gh` calls; the committer-signal ranking lives in pr_signal; the shared
+collection / I/O lives in pr_common.
 """
 from __future__ import annotations
 
@@ -47,8 +53,6 @@ from typing import Any, final
 
 import pr_signal
 from pr_common import (
-    CI_FAILED,
-    BOT_DISCLAIMER,
     Config,
     Gh,
     PR,
@@ -61,8 +65,8 @@ from pr_common import (
     find_gh,
     list_org_repos,
     list_team_members,
-    promotion_gate_passed,
     save_state,
+    target_status,
 )
 
 
@@ -78,12 +82,11 @@ class Decision:
     request_reviewers: list[str] = field(default_factory=list)
     remove_reviewers: list[str] = field(default_factory=list)  # unrequest (e.g. bmillsNV)
     add_to_project: bool = False
-    comment_kind: str | None = None  # "ready" | None
 
     def is_noop(self) -> bool:
         return not (
             self.set_status or self.set_assignee or self.request_reviewers
-            or self.remove_reviewers or self.add_to_project or self.comment_kind
+            or self.remove_reviewers or self.add_to_project
         )
 
 
@@ -101,129 +104,28 @@ def _ensure_assignee(d: Decision, pr: PR) -> None:
         d.remove_reviewers = list(pr.reviewers_to_remove)
 
 
-# --- Board-vs-reality corrections -------------------------------------------
-# Each returns a Decision when it applies to this PR (terminating reconcile,
-# even if the Decision is a no-op), or None to defer to the next correction /
-# the normal lifecycle. `_CORRECTIONS` is consulted in order.
-
-def _correct_terminal_state(pr: PR, cfg: Config) -> Decision | None:
-    # Defensive: the sweep only lists open PRs, so board automation normally
-    # handles this already.
-    if pr.state not in ("MERGED", "CLOSED"):
-        return None
-    d = Decision(pr=pr)
-    if pr.board_status != cfg.status_done:
-        d.set_status = cfg.status_done
-    return d
-
-
-def _correct_misplaced_draft(pr: PR, cfg: Config) -> Decision | None:
-    # Drafts remain otherwise exempt: no assignment or maintainer follow-ups.
-    if not (pr.is_draft and not pr.is_bot):
-        return None
-    d = Decision(pr=pr)
-    if pr.board_status in (cfg.status_todo, cfg.status_inprogress, cfg.status_done):
-        d.set_status = cfg.status_revising
-    return d
-
-
-def _ci_blocks_human(pr: PR) -> bool:
-    """A non-bot PR with failing CI is not "ready for a human" (Todo) and belongs
-    in Revising. Bot PRs are owner-shepherded and exempt. This is the shared
-    predicate behind both _correct_failing_ci and the Done-bounce below, so a PR
-    pushed out of Done with red CI settles in Revising in a single sweep instead
-    of flip-flopping Todo<->Revising across runs."""
-    return not pr.is_bot and pr.ci_state == CI_FAILED
-
-
-def _correct_done_status(pr: PR, cfg: Config) -> Decision | None:
-    # An open PR in Done is fine only while in the merge queue; if it was bumped
-    # out (or the repo has no queue) bounce it back — Revising on changes
-    # requested or failing CI, else Todo (ready for a human again).
-    if pr.board_status != cfg.status_done:
-        return None
-    d = Decision(pr=pr)
-    if pr.in_merge_queue:
-        return d
-    if pr.review_decision == "CHANGES_REQUESTED" or _ci_blocks_human(pr):
-        d.set_status = cfg.status_revising
-    else:
-        d.set_status = cfg.status_todo
-        _ensure_assignee(d, pr)
-    return d
-
-
-def _correct_failing_ci(pr: PR, cfg: Config) -> Decision | None:
-    # Bot PRs are owner-shepherded and may sit in Todo while iterating, so they
-    # are not bounced here — that would oscillate against promotion.
-    if pr.board_status in (cfg.status_todo, cfg.status_inprogress) and _ci_blocks_human(pr):
-        return Decision(pr=pr, set_status=cfg.status_revising)
-    return None
-
-
-def _correct_orphan_in_progress(pr: PR, cfg: Config) -> Decision | None:
-    # In Progress with no assignee can't be legitimately "in progress".
-    if pr.board_status == cfg.status_inprogress and not pr.assignees:
-        d = Decision(pr=pr, set_status=cfg.status_todo)
-        _ensure_assignee(d, pr)
-        return d
-    return None
-
-
-_CORRECTIONS: list[Callable[[PR, Config], Decision | None]] = [
-    _correct_terminal_state,
-    _correct_misplaced_draft,
-    _correct_done_status,
-    _correct_failing_ci,
-    _correct_orphan_in_progress,
-]
-
-
-def _normal_lifecycle(pr: PR, cfg: Config) -> Decision:
-    """The steady-state lifecycle once board-vs-reality corrections don't apply:
-    assign the owner, return on blocking feedback, otherwise promote on a passed
-    gate."""
-    d = Decision(pr=pr)
-
-    # Assign the owner + request reviewers on ready, unassigned human PRs early.
-    if not pr.is_bot:
-        _ensure_assignee(d, pr)
-
-    # Blocking review feedback returns the PR to Revising.
-    if pr.change_requested:
-        if pr.board_status != cfg.status_revising:
-            d.set_status = cfg.status_revising
-        return d
-
-    # Promotion: automated gate passed -> Todo (ready for a human). Bot PRs
-    # (incl. drafts) land here so a human owner shepherds them to ready.
-    if promotion_gate_passed(pr, cfg):
-        if pr.board_status not in (cfg.status_todo, cfg.status_inprogress, cfg.status_done):
-            d.set_status = cfg.status_todo
-            # A draft is not actually "ready for review" yet — the assignee makes
-            # it ready — so the one-time ready comment is for non-drafts only.
-            if cfg.ready_comment and not pr.is_draft:
-                d.comment_kind = "ready"
-        # Bot PRs get their assignee + reviewers at promotion (no assignee while
-        # iterating in Revising).
-        if pr.is_bot:
-            _ensure_assignee(d, pr)
-    elif not pr.board_status:
-        # Not ready yet: ensure it is at least Revising if it has no status.
-        # (In Progress is human-owned; never touched here.)
-        d.set_status = cfg.status_revising
-
-    return d
-
-
 def _reconcile_status(pr: PR, cfg: Config) -> Decision:
-    """The status/assignee decision proper: board-vs-reality corrections take
-    precedence over the normal lifecycle."""
-    for correction in _CORRECTIONS:
-        d = correction(pr, cfg)
-        if d is not None:
-            return d
-    return _normal_lifecycle(pr, cfg)
+    """The status/assignee decision proper: derive the correct stage from
+    observed reality via target_status (the shared single source of truth) and
+    correct the board toward it. Human drafts are exempt from assignment (the
+    author's "not ready" signal); every other PR (bot PRs incl. drafts, non-draft
+    humans) gets its owner + reviewers — a no-op for already-assigned or
+    merge-queued PRs, whose pick is never computed."""
+    d = Decision(pr=pr)
+
+    # Terminal: merged/closed -> Done (defensive; the sweep only lists open PRs,
+    # so the event workflow normally sets this on the `closed` event).
+    if pr.state in ("MERGED", "CLOSED"):
+        if pr.board_status != cfg.status_done:
+            d.set_status = cfg.status_done
+        return d
+
+    target = target_status(pr, cfg)
+    if not (pr.is_draft and not pr.is_bot):
+        _ensure_assignee(d, pr)
+    if pr.board_status != target:
+        d.set_status = target
+    return d
 
 
 def reconcile(pr: PR, cfg: Config) -> Decision:
@@ -323,9 +225,6 @@ def collect_board_status(gh: Gh, cfg: Config) -> dict[str, dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Apply (writes; only under --apply)
 # ---------------------------------------------------------------------------
-
-READY_COMMENT = "This PR has passed automated checks and is ready for human review."
-
 
 @final
 class Applier:
@@ -437,12 +336,6 @@ class Applier:
             args += ["-f", f"reviewers[]={login}"]
         self.gh.run(args, check=False)
 
-    def comment(self, pr: PR, body: str) -> None:
-        self.gh.run([
-            "pr", "comment", str(pr.number), "-R", pr.repo,
-            "--body", body + BOT_DISCLAIMER,
-        ], check=False)
-
 
 # ---------------------------------------------------------------------------
 # Sweep orchestration
@@ -504,8 +397,6 @@ def _plan_item(pr: PR, decision: Decision) -> dict[str, Any] | None:
         actions["request_reviewers"] = list(decision.request_reviewers)
     if decision.remove_reviewers:
         actions["remove_reviewers"] = list(decision.remove_reviewers)
-    if decision.comment_kind == "ready":
-        actions["comment_kind"] = "ready"
     if not actions:
         return None
     return {
@@ -586,8 +477,6 @@ def apply_plan(gh: Gh, cfg: Config, plan: list[dict[str, Any]]) -> int:
             applier.request_reviewers(pr, item.get("request_reviewers") or [])
         if item.get("remove_reviewers"):
             applier.remove_reviewers(pr, item["remove_reviewers"])
-        if item.get("comment_kind") == "ready":
-            applier.comment(pr, READY_COMMENT)
     return len(plan)
 
 

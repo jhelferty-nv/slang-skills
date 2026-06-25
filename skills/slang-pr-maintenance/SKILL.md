@@ -90,9 +90,9 @@ falling back to a different toolchain.
 1. **Collect** (batched `gh` GraphQL): **one paginated query per repo**
    (`DEFAULT_PR_PAGE_SIZE`, default 25) returns every open PR with everything
    needed in a single shot — core fields, author type, assignees, requested
-   reviewers, CI (`statusCheckRollup` → `ci_state` + `coverage_passed`), reviews
-   (→ `last_review_at`/`change_requested`), `mergeQueueEntry`, linked-issue
-   assignees, and changed files (for signal). **No ProjectsV2 query.**
+   reviewers, CI (`statusCheckRollup` → `ci_state`), the head commit date, reviews
+   (→ `last_review_at` / `change_requested` / `approved`), `mergeQueueEntry`,
+   linked-issue assignees, and changed files (for signal). **No ProjectsV2 query.**
 2. **Synthesize** (pure, in-memory): classify each PR's `Source` live, derive
    its lifecycle stage from the collected signals (see the mapping below), update
    each PR's stall clock, and build the assignee-grouped report from the
@@ -108,27 +108,21 @@ falling back to a different toolchain.
 The report previously read three per-PR fields from the board. It now re-derives
 (or drops) each from the live PR query — see the docstrings in `pr_report.py`:
 
-- **`board_status` → `derive_stage(pr, cfg)`.** The board `Status` was just a
-  cached reconciliation of CI/review/draft/merge-queue signals, all present in
-  the live query. Only `Revising` / `Todo` / `Done` are observable; **`In
-  Progress`** is a human board action and collapses into `Todo` (lossless — the
-  only consumer, "awaiting review", already treated them identically). The
-  derivation is **per source** ("different fingerprints"):
-  - **Contributor/Community**: `Revising` while draft / changes-requested / CI
-    failing (or not yet passed); promoted to `Todo` only once not a draft and CI
-    has passed.
-  - **Bot**: promoted to `Todo` whenever the promotion gate holds (always,
-    unless a coverage check is configured and failing); drafts are **not**
-    exempt.
-  - **Done**: terminal state or in the merge queue.
+- **`board_status` → `target_status(pr, cfg)`** (in `pr_common`). The board
+  `Status` is just a cached reconciliation of draft/CI/review/merge-queue signals,
+  all present in the live query — and `target_status` is the same single source of
+  truth the state machine and the GitHub workflow use, so the report's stage
+  matches the board exactly (`In Review` / `Revising` / `Snagged` / `Approved`;
+  the report never observes the terminal `Done` since it lists only open PRs). See
+  the State machine section below for the full priority order.
 - **`source` → `classify_source` (live, every run):** `Bot` if a bot author,
   else `Internal` if the author can commit to the repo, else `Community`. A
   manual board `Source` override is ignored (re-classified live).
 - **`project_item_id` → dropped** (only the state machine needs it, for writes).
 
-The derived stage also replaces `board_status` in the stall **move
-fingerprint**, so a contributor PR's CI going green and a bot PR's promotion each
-count as movement, per source, without the board.
+`target_status` also replaces `board_status` in the stall **move fingerprint**,
+so a PR's CI going green or an approval landing counts as movement, without the
+board.
 
 ## What the state machine does (`pr_sweep.py`)
 
@@ -139,31 +133,42 @@ count as movement, per source, without the board.
    the owner + reviewers when needed, and emit a self-contained, replayable
    **plan** (`./.pr-sweep-plan.json`).
 3. **Act** (`--apply`): replay the plan — set `Source` (when newly classified),
-   set `Status`, set assignee, request reviewers, post PR comments — each
-   idempotent (never repeats an action whose effect is already present).
+   set `Status`, set assignee, request reviewers — each idempotent (never repeats
+   an action whose effect is already present). The sweep never comments on PRs.
 
 ### State machine (board `Status` field)
 
-`Revising -> Todo -> In Progress -> Done`
+The lifecycle stage is computed by `target_status` in `pr_common` — the **single
+source of truth**, shared by the state machine and the board-free report, and
+kept **identical to `computeTarget`** in the event-driven GitHub workflow
+(`.github/workflows/pr-board-sync.yml` in the slang repo). Five states, two
+variants that differ **only on a CI failure**:
 
-- **Revising** — waiting on CI, a bot, or a bot reviewer, before any human
-  involvement.
-- **Todo** — ready for a human; assignee set. This + the board view IS the
-  reviewer's "needs review" signal (no message is sent for the routine case).
-- **In Progress** — human-set when a reviewer starts. The script never sets it.
-- **Done** — merged or closed (usually board automation; ensured here).
+- **In Review** — default for an open PR (awaiting review / CI pending / a fresh
+  commit with no feedback yet); a **Bot draft** lands here so a human owner can
+  see/shepherd it. This + the board view IS the reviewer's "needs review" signal.
+- **Revising** — a **human draft**, or a reviewer requested changes (not yet
+  superseded by a newer commit); a **Bot** PR's CI failure also lands here.
+- **Snagged** — needs a human: a **human** PR's CI failed, or an approved PR has
+  green CI but is **not** in the merge queue (a human must enqueue/merge it).
+- **Approved** — not a draft, already approved, waiting on CI / the merge queue.
+- **Done** — the PR is closed (merged or otherwise); terminal.
 
-**Auto-corrections (board vs reality).** Before the normal lifecycle, the sweep
-fixes contradictory board states rather than flagging them:
+`target_status` priority (first match wins): a current changes-request →
+`Revising`; else draft → `In Review` (Bot) / `Revising` (human); else CI failed →
+`Revising` (Bot) / `Snagged` (human); else approved → `Snagged` if green &
+un-queued else `Approved`; else `In Review`. A review counts as "current" only if
+no commit landed after it (a newer commit makes it stale → `In Review`).
 
-- **Open PR not on the board** -> add it (`addProjectV2ItemById`).
-- **Open PR in `Done`** -> left alone only if it is **in the merge queue**;
-  otherwise bounced back — `Revising` if changes were requested, else `Todo`.
-- **Human draft sitting in `Todo`/`In Progress`/`Done`** -> back to `Revising`.
-- **Human PR in `Todo`/`In Progress` with failing CI** -> back to `Revising`
-  (bot PRs are owner-shepherded and stay put, so they don't oscillate against
-  promotion).
-- **`In Progress` with no assignee** -> demote to `Todo` and assign.
+**Reconciliation (board vs reality).** The sweep does not special-case
+"contradictory" states: `reconcile` recomputes `target_status` from observed
+reality and corrects the board toward it, so drift is fixed by construction. The
+only non-derived cases are **off-board PRs** (added via `addProjectV2ItemById`,
+fields set the same pass) and **merged/closed PRs** (→ `Done`; the sweep lists
+only open PRs, so the event workflow normally sets this). The merge-queue **drop**
+is not observable to the sweep, but a dropped PR reads approved + green +
+un-queued, which `target_status` maps to `Snagged` — so the sweep agrees with the
+workflow's `dequeued -> Snagged` instead of reverting it.
 
 ## PR sources (`Source`) and per-source behavior
 
@@ -179,13 +184,15 @@ commit to the target repo, else `Community`. Behavior differs by source:
 | Board lifecycle (state machine) | yes | yes | yes |
 | Auto-request reviewer (top collaborator-not-owner) | **no** (author picks own) | **yes** | yes |
 | Report predicate ladder | **none** (excluded) | `COMMUNITY_LADDER` (incl. `needs CI approval`, `changes requested`) | `BOT_LADDER` (no CI-approval/changes rungs) |
-| Drafts | exempt (author "not ready") | exempt (author "not ready") | **not exempt → promoted + owner** |
+| Drafts | `Revising`, exempt from assignment | `Revising`, exempt from assignment | **not exempt → `In Review` + owner** |
+| CI failure (non-draft) | `Snagged` | `Snagged` | `Revising` (bot fixes itself) |
 
 **One-liner:** Internal = *self-managed*; Community = *bot-managed oversight*;
-Bot = the bot lane (a bot PR, including a draft, is promoted with an owner +
-reviewer so a human shepherds it to ready). A coverage check gates bot promotion
-**only if `DEFAULT_COVERAGE_CHECK` is configured**; otherwise the human owner is
-the gate.
+Bot = the bot lane (a bot PR, including a draft, sits in `In Review` with an owner
++ reviewer so a human shepherds it to ready). Human drafts sit in `Revising` and
+are exempt from assignment. Internal vs. Community is decided by **repo write
+access** (can the author approve workflow runs / approve+merge PRs), matching the
+event workflow's classifier.
 
 Assignee chain for Community/Bot (the source picks the owner pool): an owner
 assigned to the PR's linked issue → highest-signal committer who is an owner →
@@ -238,7 +245,7 @@ commit is fetched once per run. The ranking lives in
 ## Notification model: assignee-grouped report
 
 The project-board inbox views are the passive reviewer inbox. Routine "ready for
-review" is conveyed by `Todo` + assignee — not a message.
+review" is conveyed by `In Review` + assignee — not a message.
 
 The report (`pr_report.py`) emits **one report, grouped by assignee**, surfaced
 at most once per `DEFAULT_REPORT_INTERVAL_HOURS` (daily). Each section is one
@@ -278,8 +285,9 @@ group once `stall >= assignee_after`, and is marked overdue in place (`⬆️`) 
 Edit the ladders to retune timeouts/audiences. The report is a **current-state**
 list: an item keeps appearing until the PR moves (which resets its stall clock);
 the daily cadence is the throttle. "awaiting review" only fires when the PR has
-reached the derived `Todo` stage and a real (approve-capable) reviewer is
-requested — auto-assigned non-approvers (`DEFAULT_IGNORED_REVIEWERS`, e.g.
+reached the derived `In Review` stage (not yet approved) and a real
+(approve-capable) reviewer is requested — auto-assigned non-approvers
+(`DEFAULT_IGNORED_REVIEWERS`, e.g.
 `bmillsNV`) and bots are excluded.
 
 ### Surfacing the report (agent's job, method-agnostic)
@@ -327,9 +335,8 @@ report takes no `--maintainer`. Everything else is a constant near the top of
 | `DEFAULT_ORG` | `shader-slang` | org swept when `DEFAULT_REPOS` is empty |
 | `DEFAULT_REPOS` | _(empty)_ | comma-separated `owner/name` subset; empty -> every non-archived repo in the org |
 | `DEFAULT_PROJECT_ID` | `PVT_kwDOAb2kZs4BSJKy` | the "Slang PR Tracking" board (state machine only) |
-| `DEFAULT_STATUS_*` | `Status` / `Revising`/`Todo`/`In Progress`/`Done` | board option names (also the derived-stage names) |
+| `DEFAULT_STATUS_*` | `Status` / `In Review`/`Revising`/`Snagged`/`Approved`/`Done` | board option names (also the derived-stage names) |
 | `DEFAULT_SOURCE_*` | `Source` / `Internal`/`Community`/`Bot` | source-classification option names |
-| `DEFAULT_COVERAGE_CHECK` | _(empty)_ | optional draft-PR coverage check gating bot promotion. While empty, bot PRs (incl. drafts) promote without a gate (the human owner is the gate) |
 | `DEFAULT_OWNERS_TEAM` | `shader-slang/pr-owners` | **Community** assignee pool (parent team; includes the `bot-pr-owners` subteam) |
 | `DEFAULT_BOT_OWNERS_TEAM` | `shader-slang/bot-pr-owners` | **Bot** assignee pool |
 | extra-reviewer pool | per-repo | write+ collaborators of each PR's repo (`permissions.push == true`); members not in the owner pool |
@@ -385,7 +392,7 @@ stays a standalone, board-free run.
 
 ```bash
 python3 scripts/test_pr_sweep.py    # state machine + shared library + signal
-python3 scripts/test_pr_report.py   # board-free report (derive_stage, ladders, routing)
+python3 scripts/test_pr_report.py   # board-free report (ladders, stall clock, routing)
 ```
 
 Cover the pure decision functions with no live `gh` calls: bot + source

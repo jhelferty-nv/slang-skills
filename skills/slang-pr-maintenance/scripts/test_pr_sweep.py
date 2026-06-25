@@ -109,173 +109,168 @@ class TestCiSummary(unittest.TestCase):
 
 
 @final
-class TestReconcile(unittest.TestCase):
+class TestTargetStatus(unittest.TestCase):
+    """The five-state lattice (pr_common.target_status). Must mirror
+    computeTarget() in pr-board-sync.yml. Priority: changes-request -> draft ->
+    CI-failed -> approved -> In Review."""
     def setUp(self):
         self.cfg = make_cfg()
 
-    def test_human_draft_is_noop(self):
-        pr = make_pr(is_draft=True, is_bot=False, author="alice")
-        self.assertTrue(sweep.reconcile(pr, self.cfg).is_noop())
+    def t(self, **kw):
+        return common.target_status(make_pr(**kw), self.cfg)
+
+    def test_changes_requested_is_revising(self):
+        self.assertEqual(self.t(change_requested=True), "Revising")
+
+    def test_bot_draft_with_changes_requested_is_revising(self):
+        self.assertEqual(self.t(is_bot=True, is_draft=True, change_requested=True), "Revising")
+
+    def test_changes_requested_dominates_ci_failure(self):
+        self.assertEqual(self.t(change_requested=True, ci_state=common.CI_FAILED), "Revising")
+
+    def test_stale_changes_request_ignored(self):
+        pr = make_pr(change_requested=True,
+                     last_review_at=utc(2026, 6, 1), head_commit_at=utc(2026, 6, 2))
+        self.assertEqual(common.target_status(pr, self.cfg), "In Review")
+
+    def test_human_draft_is_revising(self):
+        self.assertEqual(self.t(is_draft=True, is_bot=False), "Revising")
+
+    def test_bot_draft_is_in_review(self):
+        self.assertEqual(self.t(is_draft=True, is_bot=True), "In Review")
+
+    def test_bot_draft_failing_ci_still_in_review(self):
+        self.assertEqual(self.t(is_draft=True, is_bot=True, ci_state=common.CI_FAILED), "In Review")
+
+    def test_human_ci_failed_is_snagged(self):
+        self.assertEqual(self.t(is_bot=False, ci_state=common.CI_FAILED), "Snagged")
+
+    def test_bot_ci_failed_is_revising(self):
+        self.assertEqual(self.t(is_bot=True, ci_state=common.CI_FAILED), "Revising")
+
+    def test_approved_ci_pending_is_approved(self):
+        self.assertEqual(self.t(approved=True, ci_state=common.CI_PENDING), "Approved")
+
+    def test_approved_in_queue_is_approved(self):
+        self.assertEqual(
+            self.t(approved=True, ci_state=common.CI_PASSED, in_merge_queue=True), "Approved")
+
+    def test_approved_green_unqueued_is_snagged(self):
+        self.assertEqual(
+            self.t(approved=True, ci_state=common.CI_PASSED, in_merge_queue=False), "Snagged")
+
+    def test_approval_superseded_by_commit_falls_through(self):
+        pr = make_pr(approved=True, ci_state=common.CI_PENDING,
+                     last_review_at=utc(2026, 6, 1), head_commit_at=utc(2026, 6, 2))
+        self.assertEqual(common.target_status(pr, self.cfg), "In Review")
+
+    def test_default_is_in_review(self):
+        self.assertEqual(self.t(ci_state=common.CI_PENDING), "In Review")
+
+
+@final
+class TestReconcile(unittest.TestCase):
+    """reconcile() = terminal-Done / set target_status / assign / add-to-board."""
+    def setUp(self):
+        self.cfg = make_cfg()
 
     def test_merged_goes_done(self):
-        pr = make_pr(state="MERGED", board_status="Todo")
+        pr = make_pr(state="MERGED", board_status="In Review")
         self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Done")
 
     def test_merged_already_done_noop(self):
-        pr = make_pr(state="MERGED", board_status="Done")
+        self.assertTrue(
+            sweep.reconcile(make_pr(state="MERGED", board_status="Done"), self.cfg).is_noop())
+
+    def test_sets_target_when_board_differs(self):
+        pr = make_pr(author="alice", assignees=["bob"], change_requested=True,
+                     board_status="In Review")
+        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
+
+    def test_noop_when_board_matches_target(self):
+        pr = make_pr(author="alice", assignees=["bob"], change_requested=True,
+                     board_status="Revising")
         self.assertTrue(sweep.reconcile(pr, self.cfg).is_noop())
 
+    def test_human_ci_failed_to_snagged(self):
+        pr = make_pr(author="alice", assignees=["bob"], ci_state=common.CI_FAILED,
+                     board_status="In Review")
+        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Snagged")
+
+    def test_bot_ci_failed_to_revising(self):
+        pr = make_pr(author="nv-slang-bot", is_bot=True, source="Bot", assignees=["bob"],
+                     ci_state=common.CI_FAILED, board_status="In Review")
+        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
+
+    def test_approved_green_unqueued_to_snagged(self):
+        pr = make_pr(author="alice", assignees=["bob"], approved=True,
+                     ci_state=common.CI_PASSED, in_merge_queue=False, board_status="Approved")
+        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Snagged")
+
+    def test_approved_in_queue_to_approved(self):
+        pr = make_pr(author="alice", assignees=["bob"], approved=True,
+                     ci_state=common.CI_PASSED, in_merge_queue=True, board_status="In Review")
+        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Approved")
+
+    # --- assignment --------------------------------------------------------
     def test_unassigned_human_gets_assignee_and_reviewers(self):
         pr = make_pr(author="alice", assignee_pick="bob", review_requests=["bob", "carol"],
-                     ci_state=common.CI_PENDING, board_status="Revising")
+                     ci_state=common.CI_PENDING, board_status="In Review")
         d = sweep.reconcile(pr, self.cfg)
         self.assertEqual(d.set_assignee, "bob")
         self.assertEqual(d.request_reviewers, ["bob", "carol"])
 
-    def test_bot_pr_assigned_at_promotion(self):
-        pr = make_pr(author="nv-slang-bot", is_bot=True, is_draft=True,
-                     coverage_passed=True, board_status="Revising",
-                     assignee_pick="bob", review_requests=["bob"])
+    def test_human_draft_exempt_from_assignment(self):
+        pr = make_pr(author="alice", is_draft=True, board_status="In Review",
+                     assignee_pick="bob")
         d = sweep.reconcile(pr, self.cfg)
-        self.assertEqual(d.set_status, "Todo")
+        self.assertEqual(d.set_status, "Revising")
+        self.assertIsNone(d.set_assignee)
+
+    def test_bot_draft_shepherded_in_review_with_owner(self):
+        pr = make_pr(author="nv-slang-bot", is_bot=True, source="Bot", is_draft=True,
+                     board_status=None, assignee_pick="bob")
+        d = sweep.reconcile(pr, self.cfg)
+        self.assertEqual(d.set_status, "In Review")
         self.assertEqual(d.set_assignee, "bob")
 
-    def test_change_requested_returns_to_revising(self):
-        pr = make_pr(author="alice", assignees=["bob"], change_requested=True,
-                     board_status="Todo", ci_state=common.CI_PASSED)
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
-
-    def test_human_ci_clean_promotes_to_todo(self):
-        pr = make_pr(author="alice", assignees=["bob"], ci_state=common.CI_PASSED,
-                     board_status="Revising")
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Todo")
-
-    def test_human_ci_pending_no_status_set_revising(self):
-        pr = make_pr(author="alice", assignees=["bob"], ci_state=common.CI_PENDING,
-                     board_status=None)
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
-
-    def test_bot_draft_goes_to_todo_without_coverage_gate(self):
-        # No coverage check configured (default cfg): a bot draft is shepherded
-        # by a human owner, so it promotes to Todo + assignee regardless of draft.
-        pr = make_pr(author="nv-slang-bot", is_bot=True, is_draft=True, source="Bot",
-                     coverage_passed=False, board_status="Revising", assignee_pick="bob")
-        d = sweep.reconcile(pr, self.cfg)
-        self.assertEqual(d.set_status, "Todo")
-        self.assertEqual(d.set_assignee, "bob")
-        self.assertIsNone(d.comment_kind)  # draft is not "ready for review" yet
-
-    def test_bot_draft_coverage_gated_when_check_configured(self):
-        cfg = make_cfg(coverage_check="draft-coverage")
-        not_ready = make_pr(author="nv-slang-bot", is_bot=True, is_draft=True, source="Bot",
-                            coverage_passed=False, board_status="Revising")
-        self.assertTrue(sweep.reconcile(not_ready, cfg).is_noop())
-        ready = make_pr(author="nv-slang-bot", is_bot=True, is_draft=True, source="Bot",
-                        coverage_passed=True, board_status="Revising", assignee_pick="bob")
-        self.assertEqual(sweep.reconcile(ready, cfg).set_status, "Todo")
-
-    def test_bot_failing_ci_in_todo_not_bounced(self):
-        # Bot PRs are owner-shepherded; a failing-CI bot PR in Todo stays put
-        # (only human PRs bounce on failing CI).
-        pr = make_pr(author="nv-slang-bot", is_bot=True, assignees=["bob"], source="Bot",
-                     ci_state=common.CI_FAILED, board_status="Todo")
+    def test_merge_queued_left_unassigned(self):
+        pr = make_pr(author="alice", approved=True, ci_state=common.CI_PASSED,
+                     in_merge_queue=True, board_status="Approved", assignee_pick=None)
         self.assertTrue(sweep.reconcile(pr, self.cfg).is_noop())
 
-    def test_in_progress_never_overwritten_on_promotion(self):
-        pr = make_pr(author="alice", assignees=["bob"], ci_state=common.CI_PASSED,
-                     board_status="In Progress")
-        self.assertTrue(sweep.reconcile(pr, self.cfg).is_noop())
-
-    # --- auto-corrections -------------------------------------------------
+    # --- off-board (add + set fields in one pass) -------------------------
     def test_off_board_pr_added(self):
-        pr = make_pr(author="alice", project_item_id=None)
-        d = sweep.reconcile(pr, self.cfg)
+        d = sweep.reconcile(make_pr(author="alice", project_item_id=None), self.cfg)
         self.assertTrue(d.add_to_project)
         self.assertFalse(d.is_noop())
 
-    def test_off_board_pr_added_and_promoted_same_pass(self):
-        # A new (off-board) PR with green CI is added AND gets its initial status
-        # in one pass, not one run late.
+    def test_off_board_pr_added_and_set_same_pass(self):
+        # A new (off-board) PR is added AND gets its initial status in one pass.
         pr = make_pr(author="alice", project_item_id=None, assignees=["bob"],
-                     ci_state=common.CI_PASSED, board_status=None)
+                     approved=True, ci_state=common.CI_PASSED, in_merge_queue=True,
+                     board_status=None)
         d = sweep.reconcile(pr, self.cfg)
         self.assertTrue(d.add_to_project)
-        self.assertEqual(d.set_status, "Todo")
+        self.assertEqual(d.set_status, "Approved")
 
     def test_off_board_plan_item_carries_source(self):
-        # The plan for an off-board PR includes the Source backfill even though
-        # it has no project_item_id yet (apply captures the new id first).
+        # The plan for an off-board PR includes the Source backfill even though it
+        # has no project_item_id yet (apply captures the new id first).
         pr = make_pr(author="alice", project_item_id=None, source="Internal",
-                     ci_state=common.CI_PASSED, assignees=["bob"], board_status=None)
+                     approved=True, ci_state=common.CI_PASSED, in_merge_queue=True,
+                     assignees=["bob"], board_status=None)
         pr.source_unset = True
         item = sweep._plan_item(pr, sweep.reconcile(pr, self.cfg))
         assert item is not None
         self.assertTrue(item["add_to_project"])
         self.assertEqual(item["set_source"], "Internal")
 
-    def test_human_draft_in_todo_moves_to_revising(self):
-        pr = make_pr(author="alice", is_draft=True, board_status="Todo")
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
-
-    def test_human_draft_in_done_moves_to_revising(self):
-        pr = make_pr(author="alice", is_draft=True, board_status="Done")
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
-
-    def test_open_done_in_merge_queue_left_alone(self):
-        pr = make_pr(author="alice", assignees=["bob"], board_status="Done",
-                     in_merge_queue=True, review_decision="APPROVED")
-        self.assertTrue(sweep.reconcile(pr, self.cfg).is_noop())
-
-    def test_open_done_not_queued_approved_back_to_todo(self):
-        pr = make_pr(author="alice", board_status="Done", in_merge_queue=False,
-                     review_decision="APPROVED", assignee_pick="bob")
-        d = sweep.reconcile(pr, self.cfg)
-        self.assertEqual(d.set_status, "Todo")
-        self.assertEqual(d.set_assignee, "bob")
-
-    def test_open_done_changes_requested_back_to_revising(self):
-        pr = make_pr(author="alice", board_status="Done", in_merge_queue=False,
-                     review_decision="CHANGES_REQUESTED")
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
-
-    def test_open_done_failing_ci_settles_in_revising(self):
-        # Bounced out of Done with red CI: settle directly in Revising (not Todo,
-        # which _correct_failing_ci would just undo next sweep). No assignee set.
-        pr = make_pr(author="alice", board_status="Done", in_merge_queue=False,
-                     review_decision="REVIEW_REQUIRED", ci_state=common.CI_FAILED,
-                     assignee_pick="bob")
-        d = sweep.reconcile(pr, self.cfg)
-        self.assertEqual(d.set_status, "Revising")
-        self.assertIsNone(d.set_assignee)
-
-    def test_open_done_bot_failing_ci_still_to_todo(self):
-        # Bots are owner-shepherded and exempt from the CI bounce, so a bot PR
-        # bumped out of Done still promotes to Todo despite red CI.
-        pr = make_pr(author="nv-slang-bot", is_bot=True, source="Bot",
-                     board_status="Done", in_merge_queue=False,
-                     review_decision="REVIEW_REQUIRED", ci_state=common.CI_FAILED,
-                     assignee_pick="bob")
-        d = sweep.reconcile(pr, self.cfg)
-        self.assertEqual(d.set_status, "Todo")
-        self.assertEqual(d.set_assignee, "bob")
-
-    def test_todo_failing_ci_back_to_revising(self):
-        pr = make_pr(author="alice", assignees=["bob"], board_status="Todo",
-                     ci_state=common.CI_FAILED)
-        self.assertEqual(sweep.reconcile(pr, self.cfg).set_status, "Revising")
-
-    def test_in_progress_no_assignee_demoted_and_assigned(self):
-        pr = make_pr(author="alice", board_status="In Progress", assignees=[],
-                     assignee_pick="bob")
-        d = sweep.reconcile(pr, self.cfg)
-        self.assertEqual(d.set_status, "Todo")
-        self.assertEqual(d.set_assignee, "bob")
-
 
 @final
 class TestApplyDecisions(unittest.TestCase):
     def test_plan_roundtrips_state(self):
-        summary = {"plan": [{"repo": "o/r", "number": 1, "set_status": "Todo"}],
+        summary = {"plan": [{"repo": "o/r", "number": 1, "set_status": "In Review"}],
                    "digest": "d", "state": {"prs": {"o/r#1": {"notified": {"idle": "T"}}}}}
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "plan.json")
@@ -286,7 +281,7 @@ class TestApplyDecisions(unittest.TestCase):
         self.assertEqual(doc["plan"], summary["plan"])
 
     def test_apply_decisions_persists_state_and_replays(self):
-        doc = {"plan": [{"repo": "o/r", "number": 1, "item_id": "I", "set_status": "Todo"},
+        doc = {"plan": [{"repo": "o/r", "number": 1, "item_id": "I", "set_status": "In Review"},
                         {"repo": "o/r", "number": 2, "item_id": "J", "set_assignee": "bob",
                          "request_reviewers": [], "remove_reviewers": ["bmillsNV"]}],
                "state": {"prs": {"o/r#1": {"notified": {"idle": "T"}}}}}
@@ -309,7 +304,7 @@ class TestApplyDecisions(unittest.TestCase):
         self.assertEqual(pr.project_item_id, "NEW_ITEM")
 
     def test_apply_decisions_no_state_writes_no_file(self):
-        doc = {"plan": [{"repo": "o/r", "number": 1, "item_id": "I", "set_status": "Todo"}]}
+        doc = {"plan": [{"repo": "o/r", "number": 1, "item_id": "I", "set_status": "In Review"}]}
         with tempfile.TemporaryDirectory() as tmp:
             state_path = os.path.join(tmp, "state.json")
             cfg = make_cfg(state_file=state_path)
@@ -585,58 +580,74 @@ class _ApplyGh:
 
 @final
 class TestSummarizeReviews(unittest.TestCase):
+    """Per-reviewer latest opinion -> (last_review_at, change_requested, approved)."""
     def test_empty(self):
-        self.assertEqual(common.summarize_reviews([]), (None, False))
+        self.assertEqual(common.summarize_reviews([]), (None, False, False))
 
-    def test_last_review_and_change_requested(self):
-        reviews = [
-            {"state": "APPROVED", "submittedAt": "2026-06-01T00:00:00Z"},
-            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-02T00:00:00Z"},
-            {"state": "COMMENTED", "submittedAt": "2026-06-03T00:00:00Z"},  # non-decisive
-        ]
-        last, changed = common.summarize_reviews(reviews)
-        self.assertEqual(last, utc(2026, 6, 3))            # latest submitted
-        self.assertTrue(changed)                            # last decisive = CHANGES_REQUESTED
+    def test_single_changes_requested(self):
+        last, changed, approved = common.summarize_reviews(
+            [{"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-02T00:00:00Z",
+              "author": {"login": "alice"}}])
+        self.assertEqual(last, utc(2026, 6, 2))
+        self.assertTrue(changed)
+        self.assertFalse(approved)
 
-    def test_approved_last_decisive(self):
-        reviews = [
-            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-01T00:00:00Z"},
-            {"state": "approved", "submittedAt": "2026-06-02T00:00:00Z"},  # case-insensitive
-        ]
-        _last, changed = common.summarize_reviews(reviews)
+    def test_single_approved_case_insensitive(self):
+        _last, changed, approved = common.summarize_reviews(
+            [{"state": "approved", "submittedAt": "2026-06-02T00:00:00Z",
+              "author": {"login": "alice"}}])
         self.assertFalse(changed)
+        self.assertTrue(approved)
+
+    def test_same_reviewer_latest_opinion_wins(self):
+        reviews = [
+            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-01T00:00:00Z", "author": {"login": "alice"}},
+            {"state": "APPROVED", "submittedAt": "2026-06-02T00:00:00Z", "author": {"login": "alice"}},
+        ]
+        _last, changed, approved = common.summarize_reviews(reviews)
+        self.assertFalse(changed)
+        self.assertTrue(approved)
+
+    def test_outstanding_change_request_blocks_approved(self):
+        reviews = [
+            {"state": "APPROVED", "submittedAt": "2026-06-01T00:00:00Z", "author": {"login": "alice"}},
+            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-02T00:00:00Z", "author": {"login": "bob"}},
+        ]
+        _last, changed, approved = common.summarize_reviews(reviews)
+        self.assertTrue(changed)
+        self.assertFalse(approved)
+
+    def test_last_review_at_includes_nondecisive(self):
+        reviews = [
+            {"state": "APPROVED", "submittedAt": "2026-06-01T00:00:00Z", "author": {"login": "alice"}},
+            {"state": "COMMENTED", "submittedAt": "2026-06-03T00:00:00Z", "author": {"login": "bob"}},
+        ]
+        last, _changed, approved = common.summarize_reviews(reviews)
+        self.assertEqual(last, utc(2026, 6, 3))
+        self.assertTrue(approved)
 
 
 @final
 class TestCIFromRollup(unittest.TestCase):
-    def setUp(self):
-        self.cfg = make_cfg()
-
     def test_null_rollup(self):
-        self.assertEqual(common.ci_state_from_rollup(None, self.cfg), (common.CI_NONE, False))
+        self.assertEqual(common.ci_state_from_rollup(None), common.CI_NONE)
 
     def test_action_required(self):
         rollup = {"contexts": {"nodes": [
-            {"__typename": "CheckRun", "name": "x", "status": "COMPLETED", "conclusion": "ACTION_REQUIRED"}]}}
-        self.assertEqual(common.ci_state_from_rollup(rollup, self.cfg)[0], common.CI_ACTION_REQUIRED)
+            {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "ACTION_REQUIRED"}]}}
+        self.assertEqual(common.ci_state_from_rollup(rollup), common.CI_ACTION_REQUIRED)
 
     def test_pending_failed_passed(self):
         pend = {"contexts": {"nodes": [{"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": None}]}}
-        self.assertEqual(common.ci_state_from_rollup(pend, self.cfg)[0], common.CI_PENDING)
+        self.assertEqual(common.ci_state_from_rollup(pend), common.CI_PENDING)
         fail = {"contexts": {"nodes": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}]}}
-        self.assertEqual(common.ci_state_from_rollup(fail, self.cfg)[0], common.CI_FAILED)
+        self.assertEqual(common.ci_state_from_rollup(fail), common.CI_FAILED)
         ok = {"contexts": {"nodes": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
-        self.assertEqual(common.ci_state_from_rollup(ok, self.cfg)[0], common.CI_PASSED)
+        self.assertEqual(common.ci_state_from_rollup(ok), common.CI_PASSED)
 
     def test_legacy_status_context(self):
         rollup = {"contexts": {"nodes": [{"__typename": "StatusContext", "context": "ci", "state": "FAILURE"}]}}
-        self.assertEqual(common.ci_state_from_rollup(rollup, self.cfg)[0], common.CI_FAILED)
-
-    def test_coverage_passed_by_name(self):
-        cfg = make_cfg(coverage_check="cov")
-        rollup = {"contexts": {"nodes": [
-            {"__typename": "CheckRun", "name": "cov", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
-        self.assertEqual(common.ci_state_from_rollup(rollup, cfg), (common.CI_PASSED, True))
+        self.assertEqual(common.ci_state_from_rollup(rollup), common.CI_FAILED)
 
 
 @final
@@ -650,9 +661,12 @@ class TestParsePrNode(unittest.TestCase):
             "assignees": {"nodes": [{"login": "bob"}]},
             "reviewRequests": {"nodes": [{"requestedReviewer": {"__typename": "User", "login": "bmillsNV"}},
                                          {"requestedReviewer": {"__typename": "Team"}}]},
-            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
-                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}}}]},
-            "reviews": {"nodes": [{"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-09T00:00:00Z"}]},
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2026-06-08T00:00:00Z",
+                "statusCheckRollup": {"contexts": {"nodes": [
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}}}]},
+            "reviews": {"nodes": [{"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-09T00:00:00Z",
+                                   "author": {"login": "rev1"}}]},
             "mergeQueueEntry": None,
             "closingIssuesReferences": {"nodes": [{"assignees": {"nodes": [{"login": "carol"}]}}]},
             "files": {"nodes": [{"path": "a.cpp", "additions": 10, "deletions": 2}]},
@@ -669,7 +683,9 @@ class TestParsePrNode(unittest.TestCase):
         self.assertEqual(pr.existing_reviewers, ["bmillsNV"])  # team entry skipped
         self.assertEqual(pr.ci_state, common.CI_PASSED)
         self.assertTrue(pr.change_requested)
+        self.assertFalse(pr.approved)
         self.assertEqual(pr.last_review_at, utc(2026, 6, 9))
+        self.assertEqual(pr.head_commit_at, utc(2026, 6, 8))
         self.assertFalse(pr.in_merge_queue)
         self.assertEqual(pr.issue_assignees, ["carol"])
         self.assertEqual(pr.changed_files, {"a.cpp": 10.0})

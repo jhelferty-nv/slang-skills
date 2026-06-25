@@ -21,21 +21,19 @@ ProjectsV2 -> live-state mapping
 The board previously supplied three per-PR fields; here they are re-derived (or
 dropped) from the live PR query:
 
-  - board_status -> derive_stage(pr, cfg). The board Status was just a cached
-    reconciliation of CI/review/draft/merge-queue signals, all present in the
-    live PR query. Only Revising / Todo / Done are observable; "In Progress" is
-    a human board action and collapses into Todo (lossless: the report's only
-    consumer, _awaiting_review, already treated Todo and In Progress
-    identically). The derivation is per source — the contributor fingerprint
-    keys on draft + CI + changes-requested, the bot fingerprint on
-    promotion_gate_passed.
+  - board_status -> target_status(pr, cfg) (in pr_common). The board Status is
+    just a cached reconciliation of draft/CI/review/merge-queue signals, all
+    present in the live PR query — and target_status is the same single source of
+    truth the state machine and the GitHub workflow use, so the report's stage
+    matches the board exactly (In Review / Revising / Snagged / Approved; the
+    report never observes the terminal Done since it lists only open PRs).
   - source -> classify_source(pr, cfg, collaborators) (live, every run). A
     manual board Source override is ignored.
   - project_item_id -> dropped (only used for board writes).
 
-Pure decision functions (derive_stage, the predicate ladders, compute_stall,
-build_report) take plain data and are covered by test_pr_report.py with no live
-`gh` calls.
+Pure decision functions (the predicate ladders, compute_stall, build_report)
+take plain data and are covered by test_pr_report.py with no live `gh` calls;
+the lifecycle stage (target_status) is covered by test_pr_sweep.py.
 """
 from __future__ import annotations
 
@@ -55,7 +53,6 @@ import pr_signal
 from pr_common import (
     CI_ACTION_REQUIRED,
     CI_FAILED,
-    CI_PASSED,
     BOT_DISCLAIMER,
     Config,
     Gh,
@@ -68,9 +65,9 @@ from pr_common import (
     list_org_repos,
     load_state,
     parse_iso,
-    promotion_gate_passed,
     pr_state_entry,
     save_state,
+    target_status,
     working_hours_between,
 )
 
@@ -107,30 +104,6 @@ class ReportItem:
 # PURE LOGIC (no I/O) -- exercised directly by test_pr_report.py
 # ---------------------------------------------------------------------------
 
-def derive_stage(pr: PR, cfg: Config) -> str:
-    """Board-free analog of the board Status field, from live GitHub signals.
-
-    Replaces the ProjectsV2 `Status` the report used to read. Only Revising /
-    Todo / Done are observable without the board; "In Progress" is a human board
-    action and collapses into Todo (the report treats them identically).
-
-    Per source ("different fingerprints"):
-      - Bot: promoted (Todo) whenever promotion_gate_passed holds (always,
-        unless a coverage check is configured and failing); drafts are NOT
-        exempt.
-      - Contributor/Community: Revising while draft / changes-requested / CI
-        failing (or not yet passed); promoted to Todo only once not a draft and
-        CI has passed.
-    """
-    if pr.state in ("MERGED", "CLOSED") or pr.in_merge_queue:
-        return cfg.status_done
-    if pr.is_bot:
-        return cfg.status_todo if promotion_gate_passed(pr, cfg) else cfg.status_revising
-    if pr.is_draft or pr.change_requested or pr.ci_state == CI_FAILED:
-        return cfg.status_revising
-    return cfg.status_todo if pr.ci_state == CI_PASSED else cfg.status_revising
-
-
 # --- Predicate ladders (the "list of predicates", per source) ----------------
 
 def format_mention(login: str, cfg: Config) -> str:
@@ -159,11 +132,11 @@ def _reviewers_text(pr: PR, cfg: Config) -> str:
 
 
 def _awaiting_review(pr: PR, cfg: Config) -> bool:
-    # Only "awaiting review" when the PR has reached the human-ready stage
-    # (derived Todo) and a real (approve-capable) reviewer is requested.
-    return (derive_stage(pr, cfg) == cfg.status_todo
+    # Only "awaiting review" when the PR is in the In Review stage with a real
+    # (approve-capable) reviewer requested and no approving review yet.
+    return (target_status(pr, cfg) == cfg.status_inreview
             and bool(_real_reviewers(pr, cfg))
-            and pr.review_decision != "APPROVED")
+            and not pr.approved)
 
 
 # Ladder rung thresholds are weekday-hours since the PR last moved.
@@ -241,10 +214,10 @@ def compute_stall(pr: PR, cfg: Config, prior: dict[str, Any], now: datetime,
     stall_days). Pure. First sight anchors to the PR's last activity so a stale
     backlog surfaces immediately.
 
-    The derived stage (derive_stage) replaces the board Status that used to
-    anchor movement: a contributor PR's CI going green and a bot PR's promotion
-    each register as movement, per source, without the board."""
-    fp = [derive_stage(pr, cfg), pr.head_sha,
+    The derived stage (target_status) replaces the board Status that used to
+    anchor movement: e.g. a PR's CI going green or an approval landing registers
+    as movement (a stage change), without the board."""
+    fp = [target_status(pr, cfg), pr.head_sha,
           pr.last_review_at.isoformat() if pr.last_review_at else None]
     prior_fp = prior.get("move_fingerprint")
     if prior_fp is None:

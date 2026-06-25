@@ -70,8 +70,6 @@ DEFAULT_IGNORED_REVIEWERS = "bmillsNV"
 DEFAULT_OWNERS_TEAM = "shader-slang/pr-owners"
 # Bot PRs are assigned an owner from this (sub)team.
 DEFAULT_BOT_OWNERS_TEAM = "shader-slang/bot-pr-owners"
-# The draft-PR coverage check whose success gates Revising -> Todo; set per deployment.
-DEFAULT_COVERAGE_CHECK = ""
 
 # Committer-signal weighting (see collect_committer_signal). Per-file signal =
 # max(additions, deletions) * file_multiplier. The table maps a directory glob
@@ -93,9 +91,10 @@ DEFAULT_SIGNAL_CLEAR_MARGIN = pr_signal.DEFAULT_SIGNAL_CLEAR_MARGIN  # skip tieb
 
 # Board option names (Status / Source single-selects).
 DEFAULT_STATUS_FIELD = "Status"
+DEFAULT_STATUS_INREVIEW = "In Review"
 DEFAULT_STATUS_REVISING = "Revising"
-DEFAULT_STATUS_TODO = "Todo"
-DEFAULT_STATUS_INPROGRESS = "In Progress"
+DEFAULT_STATUS_SNAGGED = "Snagged"
+DEFAULT_STATUS_APPROVED = "Approved"
 DEFAULT_STATUS_DONE = "Done"
 DEFAULT_SOURCE_FIELD = "Source"
 DEFAULT_SOURCE_INTERNAL = "Internal"
@@ -105,7 +104,6 @@ DEFAULT_SOURCE_BOT = "Bot"
 # Oversight / noise-control thresholds.
 DEFAULT_REPORT_INTERVAL_HOURS = 24.0  # the recipient-grouped report is surfaced at most this often
 DEFAULT_WORKDAY_TZ = "America/Los_Angeles"
-DEFAULT_READY_COMMENT = True        # post the one-time "ready for review" comment
 
 # Where the computed plan and the per-PR stall / last-report state are written.
 PLAN_FILE = "./.pr-sweep-plan.json"
@@ -130,11 +128,11 @@ class Config:
     project_id: str = DEFAULT_PROJECT_ID
     org: str = DEFAULT_ORG
     status_field: str = DEFAULT_STATUS_FIELD
+    status_inreview: str = DEFAULT_STATUS_INREVIEW
     status_revising: str = DEFAULT_STATUS_REVISING
-    status_todo: str = DEFAULT_STATUS_TODO
-    status_inprogress: str = DEFAULT_STATUS_INPROGRESS
+    status_snagged: str = DEFAULT_STATUS_SNAGGED
+    status_approved: str = DEFAULT_STATUS_APPROVED
     status_done: str = DEFAULT_STATUS_DONE
-    coverage_check: str = DEFAULT_COVERAGE_CHECK
     owners_team: str = DEFAULT_OWNERS_TEAM
     bot_owners_team: str = DEFAULT_BOT_OWNERS_TEAM
     maintainer: str = ""
@@ -156,7 +154,6 @@ class Config:
         default_factory=lambda: _split_csv(DEFAULT_IGNORED_REVIEWERS))
     report_interval_hours: float = DEFAULT_REPORT_INTERVAL_HOURS
     workday_tz: str = DEFAULT_WORKDAY_TZ
-    ready_comment: bool = DEFAULT_READY_COMMENT
     apply: bool = False
     state_file: str = STATE_FILE
     plan_file: str = PLAN_FILE
@@ -207,6 +204,7 @@ class PR:
     source_unset: bool = False  # board had no Source -> classified + needs writing
     assignees: list[str] = field(default_factory=list)
     head_sha: str = ""
+    head_commit_at: datetime | None = None  # head commit date, to detect commits landing after a review
     review_decision: str = ""  # APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | ""
     in_merge_queue: bool = False
     existing_reviewers: list[str] = field(default_factory=list)  # currently-requested reviewers
@@ -214,9 +212,9 @@ class PR:
     updated_at: datetime | None = None
     board_status: str | None = None
     ci_state: str = CI_NONE
-    coverage_passed: bool = False
     last_review_at: datetime | None = None
-    change_requested: bool = False
+    change_requested: bool = False  # a reviewer's latest opinion is CHANGES_REQUESTED
+    approved: bool = False          # a reviewer's latest opinion is APPROVED and none is CHANGES_REQUESTED
     last_activity_at: datetime | None = None
     # Selection inputs gathered during collect (for unassigned, non-exempt PRs):
     #  - committers_by_signal: candidate logins ranked by weighted file signal
@@ -272,16 +270,54 @@ def working_hours_between(start: datetime | None, end: datetime | None, tz: tzin
     return total / 3600.0
 
 
-def promotion_gate_passed(pr: PR, cfg: Config) -> bool:
-    """Whether the automated gate that promotes Revising -> Todo is satisfied.
+def has_unreviewed_commit(pr: PR) -> bool:
+    """Whether a commit landed after the most recent review, which makes that
+    review's feedback stale: the new commit "has no review feedback yet", so the
+    PR belongs back in the default In Review state (mirrors the event workflow's
+    synchronize -> In Review). False when either timestamp is unknown — we then
+    trust the review rather than guessing."""
+    return (pr.head_commit_at is not None
+            and pr.last_review_at is not None
+            and pr.head_commit_at > pr.last_review_at)
 
-    Human PRs promote on clean CI. Bot PRs are shepherded by a human owner, so
-    they promote to Todo (with an assignee) regardless of draft state — unless a
-    coverage check is configured, in which case it gates them.
+
+def target_status(pr: PR, cfg: Config) -> str:
+    """The board Status an OPEN PR should currently carry, derived purely from
+    observed signals. This is the single source of truth for the lifecycle stage,
+    shared by the state machine (pr_sweep.reconcile) and the board-free report
+    (pr_report). It MUST stay identical to computeTarget() in the event-driven
+    GitHub workflow (.github/workflows/pr-board-sync.yml) so the two never fight.
+
+    Priority (first match wins):
+      1. A reviewer's current changes-request -> Revising (the author must
+         revise). Ranked above the draft rule so even a Bot draft with a
+         changes-request is Revising. A review counts as "current" only if no
+         commit landed after it (has_unreviewed_commit makes it stale).
+      2. Draft -> a human draft is Revising (the author is still working); a Bot
+         draft is In Review, since bot PRs arrive as drafts and a human owner must
+         see/shepherd them. Ranked above CI, so a Bot draft with merely failing CI
+         still shows In Review.
+      3. CI failed -> Revising for a Bot PR (it fixes itself), Snagged for a human
+         PR (a human's attention is needed). This is the ONLY bot/human difference.
+      4. Approved (and not stale): Approved while still waiting on something
+         automated (CI pending, or sitting in the merge queue); Snagged once CI is
+         green and it is NOT queued (nothing automated left - a human must
+         enqueue/merge it; also how a merge-queue drop reads).
+      5. Otherwise -> In Review (awaiting review, CI pending, or a fresh commit
+         with no feedback yet).
     """
-    if pr.is_bot:
-        return pr.coverage_passed if cfg.coverage_check else True
-    return pr.ci_state == CI_PASSED
+    reviewed = not has_unreviewed_commit(pr)
+    if reviewed and pr.change_requested:
+        return cfg.status_revising
+    if pr.is_draft:
+        return cfg.status_inreview if pr.is_bot else cfg.status_revising
+    if pr.ci_state == CI_FAILED:
+        return cfg.status_revising if pr.is_bot else cfg.status_snagged
+    if reviewed and pr.approved:
+        if pr.ci_state == CI_PASSED and not pr.in_merge_queue:
+            return cfg.status_snagged
+        return cfg.status_approved
+    return cfg.status_inreview
 
 
 def source_for(is_bot: bool, can_commit: bool, cfg: Config) -> str:
@@ -531,9 +567,9 @@ query($owner: String!, $name: String!, $n: Int!, $cursor: String) {
         author { login __typename }
         assignees(first: 10) { nodes { login } }
         reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } } } }
-        commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+        commits(last: 1) { nodes { commit { committedDate statusCheckRollup { contexts(first: 100) { nodes {
           __typename
-          ... on CheckRun { name status conclusion }
+          ... on CheckRun { status conclusion }
           ... on StatusContext { context state }
         } } } } } }
         reviews(last: 50) { nodes { state submittedAt author { login } } }
@@ -594,24 +630,21 @@ def summarize_ci(runs: list[dict[str, Any]]) -> str:
     return CI_PASSED
 
 
-def ci_state_from_rollup(rollup: dict[str, Any] | None, cfg: Config) -> tuple[str, bool]:
-    """Map a head commit's statusCheckRollup to (ci_state, coverage_passed),
-    reusing summarize_ci. Null rollup -> (CI_NONE, False). Pure.
+def ci_state_from_rollup(rollup: dict[str, Any] | None) -> str:
+    """Map a head commit's statusCheckRollup to a single ci_state, reusing
+    summarize_ci. Null rollup -> CI_NONE. Pure.
 
     Each context is a CheckRun (status/conclusion) or a legacy StatusContext
     (state); both are normalized to the {status, conclusion} shape summarize_ci
-    consumes. coverage_passed is set from a CheckRun named cfg.coverage_check."""
+    consumes."""
     if not rollup:
-        return CI_NONE, False
+        return CI_NONE
     contexts = ((rollup.get("contexts") or {}).get("nodes")) or []
     runs: list[dict[str, Any]] = []
-    coverage_passed = False
     for c in contexts:
         if c.get("__typename") == "CheckRun":
-            conclusion = (c.get("conclusion") or "").lower()
-            runs.append({"status": (c.get("status") or "").lower(), "conclusion": conclusion})
-            if cfg.coverage_check and c.get("name") == cfg.coverage_check:
-                coverage_passed = conclusion == "success"
+            runs.append({"status": (c.get("status") or "").lower(),
+                         "conclusion": (c.get("conclusion") or "").lower()})
         else:  # StatusContext (legacy commit status)
             state = (c.get("state") or "").upper()
             if state == "SUCCESS":
@@ -620,22 +653,36 @@ def ci_state_from_rollup(rollup: dict[str, Any] | None, cfg: Config) -> tuple[st
                 runs.append({"status": "completed", "conclusion": "failure"})
             else:  # PENDING / EXPECTED
                 runs.append({"status": "in_progress", "conclusion": None})
-    return summarize_ci(runs), coverage_passed
+    return summarize_ci(runs)
 
 
-def summarize_reviews(reviews: list[dict[str, Any]]) -> tuple[datetime | None, bool]:
-    """(last_review_at, change_requested) from review nodes. Pure;
-    case-insensitive on state. change_requested = the most recent decisive
-    (APPROVED/CHANGES_REQUESTED) review requested changes."""
+def summarize_reviews(reviews: list[dict[str, Any]]) -> tuple[datetime | None, bool, bool]:
+    """(last_review_at, change_requested, approved) from review nodes. Pure;
+    case-insensitive on state.
+
+    Mirrors GitHub's `latestOpinionatedReviews`: reduce to each reviewer's most
+    recent *decisive* (APPROVED / CHANGES_REQUESTED) opinion, then
+      - change_requested = some reviewer's latest opinion is CHANGES_REQUESTED;
+      - approved         = some reviewer's latest opinion is APPROVED and none is
+                           CHANGES_REQUESTED.
+    Per-reviewer (not single-most-recent-overall) so a stale approval from A is
+    not erased by a later comment from B, matching the event workflow's gate.
+    last_review_at is the most recent review of ANY type (used for staleness)."""
     dated = [r for r in reviews if r.get("submittedAt")]
     if not dated:
-        return None, False
+        return None, False, False
     dated.sort(key=lambda r: r["submittedAt"])
     last_review_at = parse_iso(dated[-1]["submittedAt"])
-    decisive = [r for r in dated
-                if (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED")]
-    change_requested = bool(decisive) and (decisive[-1].get("state") or "").upper() == "CHANGES_REQUESTED"
-    return last_review_at, change_requested
+    latest_opinion: dict[str, str] = {}  # reviewer login -> latest decisive state
+    for r in dated:  # ascending submit time; later reviews overwrite
+        state = (r.get("state") or "").upper()
+        if state in ("APPROVED", "CHANGES_REQUESTED"):
+            login = (r.get("author") or {}).get("login") or ""
+            latest_opinion[login] = state
+    opinions = set(latest_opinion.values())
+    change_requested = "CHANGES_REQUESTED" in opinions
+    approved = ("APPROVED" in opinions) and not change_requested
+    return last_review_at, change_requested, approved
 
 
 def parse_pr_node(node: dict[str, Any], repo: str, cfg: Config) -> PR:
@@ -645,10 +692,11 @@ def parse_pr_node(node: dict[str, Any], repo: str, cfg: Config) -> PR:
     is_bot = author.get("__typename") == "Bot" or pr_signal.classify_is_bot(login, cfg.bot_authors)
 
     commits = ((node.get("commits") or {}).get("nodes")) or []
-    rollup = (((commits[0].get("commit") or {}).get("statusCheckRollup")) if commits else None)
-    ci_state, coverage_passed = ci_state_from_rollup(rollup, cfg)
+    head_commit = (commits[0].get("commit") or {}) if commits else {}
+    ci_state = ci_state_from_rollup(head_commit.get("statusCheckRollup"))
+    head_commit_at = parse_iso(head_commit.get("committedDate"))
 
-    last_review_at, change_requested = summarize_reviews(
+    last_review_at, change_requested, approved = summarize_reviews(
         ((node.get("reviews") or {}).get("nodes")) or [])
 
     existing_reviewers: list[str] = []
@@ -684,6 +732,7 @@ def parse_pr_node(node: dict[str, Any], repo: str, cfg: Config) -> PR:
         node_id=node.get("id", "") or "",
         assignees=assignees,
         head_sha=node.get("headRefOid", "") or "",
+        head_commit_at=head_commit_at,
         review_decision=node.get("reviewDecision", "") or "",
         existing_reviewers=existing_reviewers,
         in_merge_queue=(node.get("mergeQueueEntry") is not None),
@@ -691,9 +740,9 @@ def parse_pr_node(node: dict[str, Any], repo: str, cfg: Config) -> PR:
         updated_at=parse_iso(node.get("updatedAt")),
         last_activity_at=parse_iso(node.get("updatedAt")),
         ci_state=ci_state,
-        coverage_passed=coverage_passed,
         last_review_at=last_review_at,
         change_requested=change_requested,
+        approved=approved,
         issue_assignees=issue_assignees,
         changed_files=changed_files,
     )
