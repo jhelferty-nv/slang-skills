@@ -128,10 +128,8 @@ class TestTargetStatus(unittest.TestCase):
     def test_changes_requested_dominates_ci_failure(self):
         self.assertEqual(self.t(change_requested=True, ci_state=common.CI_FAILED), "Revising")
 
-    def test_stale_changes_request_ignored(self):
-        pr = make_pr(change_requested=True,
-                     last_review_at=utc(2026, 6, 1), head_commit_at=utc(2026, 6, 2))
-        self.assertEqual(common.target_status(pr, self.cfg), "In Review")
+    # (Review-freshness is now decided in summarize_reviews via commit identity;
+    # see TestSummarizeReviews. target_status just consumes change_requested/approved.)
 
     def test_human_draft_is_revising(self):
         self.assertEqual(self.t(is_draft=True, is_bot=False), "Revising")
@@ -168,11 +166,6 @@ class TestTargetStatus(unittest.TestCase):
     def test_approved_green_unqueued_is_snagged(self):
         self.assertEqual(
             self.t(approved=True, ci_state=common.CI_PASSED, in_merge_queue=False), "Snagged")
-
-    def test_approval_superseded_by_commit_falls_through(self):
-        pr = make_pr(approved=True, ci_state=common.CI_PENDING,
-                     last_review_at=utc(2026, 6, 1), head_commit_at=utc(2026, 6, 2))
-        self.assertEqual(common.target_status(pr, self.cfg), "In Review")
 
     def test_default_is_in_review(self):
         self.assertEqual(self.t(ci_state=common.CI_PENDING), "In Review")
@@ -590,50 +583,76 @@ class _ApplyGh:
 
 @final
 class TestSummarizeReviews(unittest.TestCase):
-    """Per-reviewer latest opinion -> (last_review_at, change_requested, approved)."""
-    def test_empty(self):
-        self.assertEqual(common.summarize_reviews([]), (None, False, False))
+    """Per-reviewer latest opinion, counted only when made on the CURRENT head
+    commit (commit.oid == head_oid)."""
+    HEAD = "headsha"
 
-    def test_single_changes_requested(self):
+    def rv(self, state, login, oid, at):
+        return {"state": state, "submittedAt": at, "author": {"login": login},
+                "commit": {"oid": oid}}
+
+    def test_empty(self):
+        self.assertEqual(common.summarize_reviews([], self.HEAD), (None, False, False))
+
+    def test_changes_requested_on_head(self):
         last, changed, approved = common.summarize_reviews(
-            [{"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-02T00:00:00Z",
-              "author": {"login": "alice"}}])
+            [self.rv("CHANGES_REQUESTED", "alice", self.HEAD, "2026-06-02T00:00:00Z")], self.HEAD)
         self.assertEqual(last, utc(2026, 6, 2))
         self.assertTrue(changed)
         self.assertFalse(approved)
 
-    def test_single_approved_case_insensitive(self):
-        _last, changed, approved = common.summarize_reviews(
-            [{"state": "approved", "submittedAt": "2026-06-02T00:00:00Z",
-              "author": {"login": "alice"}}])
+    def test_approved_on_head_case_insensitive(self):
+        _l, changed, approved = common.summarize_reviews(
+            [self.rv("approved", "alice", self.HEAD, "2026-06-02T00:00:00Z")], self.HEAD)
         self.assertFalse(changed)
         self.assertTrue(approved)
 
-    def test_same_reviewer_latest_opinion_wins(self):
+    def test_changes_request_on_old_commit_is_stale(self):
+        # opinion made on an earlier commit -> superseded by the new head -> ignored
+        _l, changed, approved = common.summarize_reviews(
+            [self.rv("CHANGES_REQUESTED", "alice", "oldsha", "2026-06-02T00:00:00Z")], self.HEAD)
+        self.assertFalse(changed)
+        self.assertFalse(approved)
+
+    def test_approval_on_old_commit_is_stale(self):
+        _l, changed, approved = common.summarize_reviews(
+            [self.rv("APPROVED", "alice", "oldsha", "2026-06-02T00:00:00Z")], self.HEAD)
+        self.assertFalse(approved)
+        self.assertFalse(changed)
+
+    def test_same_reviewer_latest_on_head_wins(self):
+        # alice requested changes on an old commit, then approved the head
         reviews = [
-            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-01T00:00:00Z", "author": {"login": "alice"}},
-            {"state": "APPROVED", "submittedAt": "2026-06-02T00:00:00Z", "author": {"login": "alice"}},
+            self.rv("CHANGES_REQUESTED", "alice", "oldsha", "2026-06-01T00:00:00Z"),
+            self.rv("APPROVED", "alice", self.HEAD, "2026-06-02T00:00:00Z"),
         ]
-        _last, changed, approved = common.summarize_reviews(reviews)
+        _l, changed, approved = common.summarize_reviews(reviews, self.HEAD)
         self.assertFalse(changed)
         self.assertTrue(approved)
 
     def test_outstanding_change_request_blocks_approved(self):
+        # both on head: alice approved, bob requests changes
         reviews = [
-            {"state": "APPROVED", "submittedAt": "2026-06-01T00:00:00Z", "author": {"login": "alice"}},
-            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-02T00:00:00Z", "author": {"login": "bob"}},
+            self.rv("APPROVED", "alice", self.HEAD, "2026-06-01T00:00:00Z"),
+            self.rv("CHANGES_REQUESTED", "bob", self.HEAD, "2026-06-02T00:00:00Z"),
         ]
-        _last, changed, approved = common.summarize_reviews(reviews)
+        _l, changed, approved = common.summarize_reviews(reviews, self.HEAD)
         self.assertTrue(changed)
         self.assertFalse(approved)
 
     def test_last_review_at_includes_nondecisive(self):
         reviews = [
-            {"state": "APPROVED", "submittedAt": "2026-06-01T00:00:00Z", "author": {"login": "alice"}},
-            {"state": "COMMENTED", "submittedAt": "2026-06-03T00:00:00Z", "author": {"login": "bob"}},
+            self.rv("APPROVED", "alice", self.HEAD, "2026-06-01T00:00:00Z"),
+            self.rv("COMMENTED", "bob", self.HEAD, "2026-06-03T00:00:00Z"),
         ]
-        last, _changed, approved = common.summarize_reviews(reviews)
-        self.assertEqual(last, utc(2026, 6, 3))
+        last, _c, approved = common.summarize_reviews(reviews, self.HEAD)
+        self.assertEqual(last, utc(2026, 6, 3))  # latest of any type (stall signal)
+        self.assertTrue(approved)
+
+    def test_no_head_oid_counts_all_latest_opinions(self):
+        # fallback when head_oid is unknown ("") -> currency not enforced
+        _l, _c, approved = common.summarize_reviews(
+            [self.rv("APPROVED", "alice", "whatever", "2026-06-01T00:00:00Z")])
         self.assertTrue(approved)
 
 
@@ -672,11 +691,11 @@ class TestParsePrNode(unittest.TestCase):
             "reviewRequests": {"nodes": [{"requestedReviewer": {"__typename": "User", "login": "bmillsNV"}},
                                          {"requestedReviewer": {"__typename": "Team"}}]},
             "commits": {"nodes": [{"commit": {
-                "committedDate": "2026-06-08T00:00:00Z",
                 "statusCheckRollup": {"contexts": {"nodes": [
                     {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}}}]},
+            # changes-request on the current head (commit.oid == headRefOid) -> current
             "reviews": {"nodes": [{"state": "CHANGES_REQUESTED", "submittedAt": "2026-06-09T00:00:00Z",
-                                   "author": {"login": "rev1"}}]},
+                                   "author": {"login": "rev1"}, "commit": {"oid": "abc123"}}]},
             "mergeQueueEntry": None,
             "closingIssuesReferences": {"nodes": [{"assignees": {"nodes": [{"login": "carol"}]}}]},
             "files": {"nodes": [{"path": "a.cpp", "additions": 10, "deletions": 2}]},
@@ -692,10 +711,9 @@ class TestParsePrNode(unittest.TestCase):
         self.assertEqual(pr.assignees, ["bob"])
         self.assertEqual(pr.existing_reviewers, ["bmillsNV"])  # team entry skipped
         self.assertEqual(pr.ci_state, common.CI_PASSED)
-        self.assertTrue(pr.change_requested)
+        self.assertTrue(pr.change_requested)  # review is on the head commit (abc123)
         self.assertFalse(pr.approved)
         self.assertEqual(pr.last_review_at, utc(2026, 6, 9))
-        self.assertEqual(pr.head_commit_at, utc(2026, 6, 8))
         self.assertFalse(pr.in_merge_queue)
         self.assertEqual(pr.issue_assignees, ["carol"])
         self.assertEqual(pr.changed_files, {"a.cpp": 10.0})

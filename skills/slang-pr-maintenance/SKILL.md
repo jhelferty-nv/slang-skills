@@ -159,8 +159,9 @@ variants that differ **only on a CI failure**:
 `Revising`; else draft → `In Review` (Bot) / `Revising` (human); else CI
 `action_required` → `Snagged` (always); else CI failed → `Revising` (Bot) /
 `Snagged` (human); else approved → `Snagged` if green & un-queued else `Approved`;
-else `In Review`. A review counts as "current" only if no commit landed after it
-(a newer commit makes it stale → `In Review`).
+else `In Review`. A review opinion counts only if it was made on the **current
+head commit** (`commit.oid == headRefOid`); an opinion on an earlier commit is
+superseded by a newer push (→ `In Review` until re-reviewed).
 
 **Reconciliation (board vs reality).** The sweep does not special-case
 "contradictory" states: `reconcile` recomputes `target_status` from observed
