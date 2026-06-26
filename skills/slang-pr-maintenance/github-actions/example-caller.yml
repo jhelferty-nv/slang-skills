@@ -1,0 +1,42 @@
+# Example caller workflow for any shader-slang repo that wants the event-driven
+# PR board sync (add-to-board, Source classification, Status state machine, and
+# ignored-reviewer cleanup) on the shared "Slang PR Tracking" board.
+#
+# Copy this file to `.github/workflows/pr-maintenance.yml` in the consuming repo.
+# It only declares the PR event triggers and delegates everything to the central
+# reusable workflow in shader-slang/slang. All board IDs default to the shared
+# board, so no `with:` block is needed.
+#
+# Secret setup: map the single org-level secret SLANG_PR_BOT_TOKEN (a dedicated
+# bot PAT). The reusable workflow uses it for every GitHub call, so it needs no
+# `permissions:` block and growing its capabilities never changes this caller.
+# See pr-board-sync.yml for the exact scopes the token needs.
+#
+# Pin to a tag/SHA instead of @master if you want change control:
+#   uses: shader-slang/slang/.github/workflows/pr-board-sync.yml@v1
+
+name: PR Maintenance
+
+on:
+  pull_request_target:
+    types:
+      [
+        opened,
+        reopened,
+        synchronize,
+        closed,
+        ready_for_review,
+        converted_to_draft,
+        enqueued,
+        dequeued,
+      ]
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+
+jobs:
+  board-sync:
+    uses: shader-slang/slang/.github/workflows/pr-board-sync.yml@master
+    secrets:
+      SLANG_PR_BOT_TOKEN: ${{ secrets.SLANG_PR_BOT_TOKEN }}
