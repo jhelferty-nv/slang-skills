@@ -65,6 +65,7 @@ from pr_common import (
     find_gh,
     list_org_repos,
     list_team_members,
+    resolve_maintainer,
     save_state,
     target_status,
 )
@@ -412,6 +413,9 @@ def _plan_item(pr: PR, decision: Decision) -> dict[str, Any] | None:
 def run_sweep(gh: Gh, cfg: Config, now: datetime) -> dict[str, Any]:
     """Compute the board-reconciliation plan (side-effect free apart from
     writing the plan file). The report + stall clocks live in pr_report.py."""
+    # Resolve the fallback assignee once (override -> maintainer team -> bmillsNV)
+    # so _select_assignee_reviewers can use it as the terminal pick.
+    cfg.maintainer = resolve_maintainer(gh, cfg)
     owners_members = list_team_members(gh, cfg.owners_team)
     bot_owners_members = list_team_members(gh, cfg.bot_owners_team)
 
@@ -501,18 +505,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description=(
             "Reconcile open shader-slang PRs on the 'Slang PR Tracking' board "
             "(ProjectsV2 read+write). All configuration lives in the constants "
-            "at the top of pr_common.py. Modes: '--maintainer LOGIN' plans (dry "
-            "run, writes the plan file); '--apply' replays the saved plan; both "
-            "together is a one-shot sweep. The board-free report lives in "
-            "pr_report.py."
+            "at the top of pr_common.py. Modes: no flags plans (dry run, writes "
+            "the plan file); '--apply' computes and applies in one shot; "
+            "'--replay' applies the previously saved plan as-is. The fallback "
+            "assignee is resolved from the maintainer team (then bmillsNV); pass "
+            "'--maintainer LOGIN' only to override it. The board-free report "
+            "lives in pr_report.py."
         )
     )
     p.add_argument("--maintainer", default="",
-                   help="Login of the current Slang Maintainer (the fallback assignee). "
-                        "Required to compute a plan; not needed to --apply a saved plan.")
+                   help="Optional override for the fallback assignee. When omitted it is "
+                        "resolved from the maintainer team (shader-slang/slang-maintainer), "
+                        "else bmillsNV.")
     p.add_argument("--apply", action="store_true",
-                   help="Perform GitHub writes. Without --maintainer, replays the saved "
-                        "plan file; with --maintainer, computes and applies in one shot.")
+                   help="Compute a fresh plan and apply it (one-shot). Omit to plan only "
+                        "(dry run).")
+    p.add_argument("--replay", action="store_true",
+                   help="Apply the previously saved plan file as-is, without recomputing.")
     return p.parse_args(argv)
 
 
@@ -538,29 +547,25 @@ def main(argv: list[str]) -> int:
     gh = Gh(find_gh())
     gh.preflight()
 
-    # Replay-apply: --apply with no maintainer -> apply the saved plan as-is.
-    # This is the "apply half"; one-shot below runs the same apply step on a
-    # freshly computed plan, so one-shot == plan + replay-apply.
-    if args.apply and not maintainer:
+    # Replay: apply the saved plan as-is, without recomputing. This is the bare
+    # "apply half"; the one-shot path below runs the same apply step on a freshly
+    # computed plan, so one-shot == plan + replay.
+    if args.replay:
         cfg = Config(apply=True)
         doc = load_plan(cfg.plan_file)
         if doc is None:
             raise SystemExit(
                 f"No saved plan at {cfg.plan_file}. Run a plan pass first "
-                "(`--maintainer LOGIN`), or pass --maintainer to compute + apply in one shot."
+                "(no flags), or use --apply to compute + apply in one shot."
             )
         n = apply_decisions(gh, cfg, doc)
         print(f"[APPLY] executed {n} planned items from {cfg.plan_file} "
               f"(planned {doc.get('generated_at')})")
         return 0
 
-    # Plan or one-shot: both require a maintainer (the fallback assignee).
-    if not maintainer:
-        raise SystemExit(
-            "Pass --maintainer <login> (the current Slang Maintainer) to compute a "
-            "plan, or --apply to replay the saved plan."
-        )
-
+    # Plan (no flags, dry run) or one-shot (--apply). The fallback assignee is
+    # resolved inside run_sweep (override -> maintainer team -> bmillsNV); the
+    # optional --maintainer here is just that override.
     cfg = Config(maintainer=maintainer, apply=args.apply)
 
     # Default scope: every non-archived repo in the org (DEFAULT_REPOS is empty).

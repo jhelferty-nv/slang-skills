@@ -376,6 +376,50 @@ class TestSelectAssigneeAndReviewers(unittest.TestCase):
 
 
 @final
+class _TeamGh:
+    """Fake gh returning a fixed org-team membership (newline-joined logins, as
+    `gh api ... | jq .[].login` yields) for resolve_maintainer tests."""
+    def __init__(self, members):
+        self._members = members
+
+    def api(self, path, jq=None, paginate=False):
+        return "\n".join(self._members)
+
+
+@final
+class TestResolveMaintainer(unittest.TestCase):
+    def test_explicit_override_wins(self):
+        cfg = make_cfg(maintainer="alice")
+        self.assertEqual(common.resolve_maintainer(_TeamGh(["zoe", "bob"]), cfg), "alice")
+
+    def test_team_sorted_first_member(self):
+        cfg = make_cfg(maintainer="")
+        self.assertEqual(common.resolve_maintainer(_TeamGh(["zoe", "bob"]), cfg), "bob")
+
+    def test_falls_back_when_team_empty(self):
+        cfg = make_cfg(maintainer="", fallback_assignee="bmillsNV")
+        self.assertEqual(common.resolve_maintainer(_TeamGh([]), cfg), "bmillsNV")
+
+    def test_empty_when_team_and_fallback_unset(self):
+        cfg = make_cfg(maintainer="", fallback_assignee="")
+        self.assertEqual(common.resolve_maintainer(_TeamGh([]), cfg), "")
+
+
+@final
+class TestSelectAssigneeIgnoredFilter(unittest.TestCase):
+    """The bmillsNV fallback assignee is assigned but never requested as a
+    reviewer (it is an ignored non-approver)."""
+    def test_fallback_assignee_not_requested_as_reviewer(self):
+        cfg = make_cfg(maintainer="bmillsNV", ignored_reviewers=["bmillsNV"])
+        pr = make_pr(author="alice", source="Community", issue_assignees=[],
+                     committers_by_signal=[])  # no issue/owner pick -> maintainer
+        common._select_assignee_reviewers(
+            pr, cfg, set(), set(), lambda _repo: set())
+        self.assertEqual(pr.assignee_pick, "bmillsNV")
+        self.assertEqual(pr.review_requests, [])  # bmillsNV filtered out
+
+
+@final
 class TestSourceClassify(unittest.TestCase):
     def setUp(self):
         self.cfg = make_cfg()

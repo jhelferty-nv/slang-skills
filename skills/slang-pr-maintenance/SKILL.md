@@ -3,7 +3,7 @@ name: slang-pr-maintenance
 license: MIT
 description: "Surface the open shader-slang PRs needing human attention with a bundled gh-only Python script (scripts/pr_report.py): a board-free, once-daily assignee-grouped escalation report computed entirely from live GitHub state (no ProjectsV2 access, no writes; optional Discord mentions). A separate script (scripts/pr_sweep.py) is the ProjectsV2 state machine that classifies each PR, advances its board Status, and assigns owners + reviewers. Use for PR triage, the reviewer-attention report, reviewer assignment, stale-PR follow-up, or a scheduled PR sweep."
 provides: []
-argument-hint: "report: [--recipient-map PATH] | state machine: --maintainer LOGIN [--apply]"
+argument-hint: "report: [--recipient-map PATH] | state machine: [--apply | --replay] [--maintainer LOGIN]"
 allowed-tools: Bash Read Grep Glob
 ---
 
@@ -35,10 +35,12 @@ thresholds) is a constant at the top of `pr_common.py`; edit it there if it ever
 moves. The board id (`PVT_kwDOAb2kZs4BSJKy`, "Slang PR Tracking") is hard-coded
 and used only by the state machine.
 
-`--maintainer LOGIN` is the current Slang Maintainer (rotates every two weeks —
-no default); the **state machine** uses it as the fallback assignee. The
-**report** does not take it: it never predicts owners and does not special-case
-the maintainer (see the Unassigned group below).
+The **state machine's** fallback assignee (the current Slang Maintainer) is
+resolved automatically: the sorted-first member of the `shader-slang/slang-maintainer`
+team, else `bmillsNV` if that team is empty/unset, so a PR is never left
+unassigned. `--maintainer LOGIN` is an optional override of that resolution. The
+**report** never predicts owners and does not special-case the maintainer (see
+the Unassigned group below).
 
 **Report (default) — board-free, no GitHub writes:**
 
@@ -59,14 +61,17 @@ The report reads only live GitHub state, persists its own local state file
 
 ```bash
 # One-shot: compute a plan and apply it (board writes). Scheduled runs use this.
-python3 scripts/pr_sweep.py --maintainer <login> --apply
-
-# DRY RUN / debugging — omit --apply: compute, print the summary, and write a
-# replayable plan to ./.pr-sweep-plan.json. No GitHub writes.
-python3 scripts/pr_sweep.py --maintainer <login>
-
-# REPLAY — omit --maintainer (keep --apply): apply the last saved plan as-is.
 python3 scripts/pr_sweep.py --apply
+
+# DRY RUN / debugging — no flags: compute, print the summary, and write a
+# replayable plan to ./.pr-sweep-plan.json. No GitHub writes.
+python3 scripts/pr_sweep.py
+
+# REPLAY — apply the last saved plan as-is, without recomputing.
+python3 scripts/pr_sweep.py --replay
+
+# Override the auto-resolved fallback assignee (rarely needed):
+python3 scripts/pr_sweep.py --maintainer <login> --apply
 ```
 
 The plan/apply split lets a maintainer eyeball (or diff) `./.pr-sweep-plan.json`
@@ -132,9 +137,10 @@ board.
    classify when empty), compute the single board transition it warrants, pick
    the owner + reviewers when needed, and emit a self-contained, replayable
    **plan** (`./.pr-sweep-plan.json`).
-3. **Act** (`--apply`): replay the plan — set `Source` (when newly classified),
-   set `Status`, set assignee, request reviewers — each idempotent (never repeats
-   an action whose effect is already present). The sweep never comments on PRs.
+3. **Act** (`--apply`, or `--replay` for a saved plan): execute the plan — set
+   `Source` (when newly classified), set `Status`, set assignee, request reviewers
+   — each idempotent (never repeats an action whose effect is already present).
+   The sweep never comments on PRs.
 
 ### State machine (board `Status` field)
 
@@ -199,7 +205,8 @@ event workflow's classifier.
 
 Assignee chain for Community/Bot (the source picks the owner pool): an owner
 assigned to the PR's linked issue → highest-signal committer who is an owner →
-`--maintainer`. This chain is the **state machine's** (it writes the assignee);
+the resolved maintainer (the `slang-maintainer` team's sorted-first member, else
+`bmillsNV`). This chain is the **state machine's** (it writes the assignee);
 the report does not predict — it shows whatever assignee GitHub currently has,
 and groups the rest under **Unassigned**. Blocking review feedback returns any
 PR to `Revising` (state machine).
@@ -320,17 +327,18 @@ case-insensitively):
 
 1. Run `scripts/pr_report.py --recipient-map <path>` (the default). When the
    exit code is `10`, surface the report to its recipients (method-agnostic).
-2. Optionally run the state machine `scripts/pr_sweep.py --maintainer <login>
-   --apply` to keep the board reconciled (on a backlog run, plan first, eyeball
-   `./.pr-sweep-plan.json`, then `--apply`).
+2. Optionally run the state machine `scripts/pr_sweep.py --apply` to keep the
+   board reconciled (on a backlog run, plan first with no flags, eyeball
+   `./.pr-sweep-plan.json`, then `--replay`).
 
 Everything else is the scripts'.
 
 ## Configuration (top-of-file constants in `pr_common.py`)
 
-The flags are `--maintainer LOGIN` (state machine only; no default),
-`--recipient-map PATH` (report only), and `--apply` (state machine only). The
-report takes no `--maintainer`. Everything else is a constant near the top of
+The flags are `--apply` / `--replay` and the optional `--maintainer LOGIN`
+override (state machine only), and `--recipient-map PATH` (report only). The
+fallback assignee otherwise resolves from the `slang-maintainer` team (then
+`bmillsNV`). The report takes none of these. Everything else is a constant near the top of
 `pr_common.py` — edit it there if it moves:
 
 | Constant | Value | Notes |
@@ -374,8 +382,8 @@ Required access differs by script:
   report does not predict owners, so it reads no team membership.
 
 **State machine (`pr_sweep.py`):** everything above **plus `read:org`** (owner
-team membership for assignee selection), **ProjectsV2 read** (board
-`Status`/`Source`), and — for `--apply` — **repo write**
++ `slang-maintainer` team membership for assignee selection), **ProjectsV2 read**
+(board `Status`/`Source`), and — for `--apply`/`--replay` — **repo write**
 (issues/comments/assignees) **+ ProjectsV2 write**.
 
 A local clone is NOT required (history / board access go through `gh api`);
@@ -387,9 +395,9 @@ Any scheduler works (cron, CI, or — in nanoclaw — a `schedule_task`). Run th
 **report** (`pr_report.py --recipient-map <path>`) on a cadence; it
 self-throttles to once per `DEFAULT_REPORT_INTERVAL_HOURS` (daily) and exit code
 `10` means "the report is due to surface." Run the **state machine**
-(`pr_sweep.py --maintainer <login> --apply`) ~every 30-60 min to keep the board
-reconciled. The state machine is being adapted into GitHub Actions; the report
-stays a standalone, board-free run.
+(`pr_sweep.py --apply`) ~every 30-60 min to keep the board reconciled. The state
+machine is being adapted into GitHub Actions; the report stays a standalone,
+board-free run.
 
 ## Tests
 

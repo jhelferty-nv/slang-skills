@@ -70,6 +70,14 @@ DEFAULT_IGNORED_REVIEWERS = "bmillsNV"
 DEFAULT_OWNERS_TEAM = "shader-slang/pr-owners"
 # Bot PRs are assigned an owner from this (sub)team.
 DEFAULT_BOT_OWNERS_TEAM = "shader-slang/bot-pr-owners"
+# The current maintainer is tracked by this org team; its (sorted-first) member
+# is the fallback assignee when a non-Internal PR has no linked-issue or
+# committer-signal owner. See resolve_maintainer.
+DEFAULT_MAINTAINER_TEAM = "shader-slang/slang-maintainer"
+# Last-resort assignee when the maintainer team is empty/unset/unreadable, so a
+# PR is never left unassigned. Typically an ignored non-approver, so it is never
+# requested as a reviewer (see _select_assignee_reviewers).
+DEFAULT_FALLBACK_ASSIGNEE = "bmillsNV"
 
 # Committer-signal weighting (see collect_committer_signal). Per-file signal =
 # max(additions, deletions) * file_multiplier. The table maps a directory glob
@@ -135,7 +143,11 @@ class Config:
     status_done: str = DEFAULT_STATUS_DONE
     owners_team: str = DEFAULT_OWNERS_TEAM
     bot_owners_team: str = DEFAULT_BOT_OWNERS_TEAM
+    # Optional explicit override of the fallback assignee; when empty it is
+    # resolved from maintainer_team (then fallback_assignee). See resolve_maintainer.
     maintainer: str = ""
+    maintainer_team: str = DEFAULT_MAINTAINER_TEAM
+    fallback_assignee: str = DEFAULT_FALLBACK_ASSIGNEE
     source_field: str = DEFAULT_SOURCE_FIELD
     source_internal: str = DEFAULT_SOURCE_INTERNAL
     source_community: str = DEFAULT_SOURCE_COMMUNITY
@@ -409,6 +421,11 @@ def _select_assignee_reviewers(pr: PR, cfg: Config, owners_members: set[str],
         bot_authors=cfg.bot_authors,
         ignored_reviewers=set(cfg.ignored_reviewers),
     )
+    # Never request an ignored non-approver (e.g. the bmillsNV fallback assignee,
+    # which can become the pick); this can leave review_requests empty, which is
+    # fine. Mirrors the reviewer filter in pr-board-sync.yml's reconcileAssignment.
+    pr.review_requests = [
+        r for r in pr.review_requests if r.lower() not in ignored_lower]
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +543,22 @@ def list_team_members(gh: Gh, team: str) -> set[str]:
     org, slug = team.split("/", 1)
     raw = gh.api(f"orgs/{org}/teams/{slug}/members", jq=".[].login", paginate=True)
     return {line.strip() for line in (raw or "").splitlines() if line.strip()}
+
+
+def resolve_maintainer(gh: Gh, cfg: Config) -> str:
+    """The fallback assignee for a non-Internal PR with no linked-issue or
+    committer-signal owner, so it is never left unassigned. Resolution order:
+    an explicit cfg.maintainer override; else the (sorted-first) member of
+    cfg.maintainer_team; else cfg.fallback_assignee (e.g. bmillsNV). Returns ""
+    only if all three are unset. Mirrors resolveMaintainer in pr-board-sync.yml."""
+    if cfg.maintainer:
+        return cfg.maintainer
+    members = sorted(list_team_members(gh, cfg.maintainer_team))
+    if len(members) > 1:
+        _progress(
+            f"  maintainer team {cfg.maintainer_team} has {len(members)} members; "
+            f"using {members[0]}")
+    return members[0] if members else cfg.fallback_assignee
 
 
 def collect_repo_collaborators(gh: Gh, repo: str) -> set[str]:
