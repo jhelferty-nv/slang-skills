@@ -297,8 +297,10 @@ def target_status(pr: PR, cfg: Config) -> str:
          draft is In Review, since bot PRs arrive as drafts and a human owner must
          see/shepherd them. Ranked above CI, so a Bot draft with merely failing CI
          still shows In Review.
-      3. CI failed -> Revising for a Bot PR (it fixes itself), Snagged for a human
-         PR (a human's attention is needed). This is the ONLY bot/human difference.
+      3. CI needs approval (CI_ACTION_REQUIRED, e.g. a fork PR awaiting a
+         maintainer to approve the run) -> Snagged (always; a human gates it).
+         CI failed -> Revising for a Bot PR (it fixes itself), Snagged for a human
+         PR. The bot/human split applies only to a failure, not to action_required.
       4. Approved (and not stale): Approved while still waiting on something
          automated (CI pending, or sitting in the merge queue); Snagged once CI is
          green and it is NOT queued (nothing automated left - a human must
@@ -311,6 +313,8 @@ def target_status(pr: PR, cfg: Config) -> str:
         return cfg.status_revising
     if pr.is_draft:
         return cfg.status_inreview if pr.is_bot else cfg.status_revising
+    if pr.ci_state == CI_ACTION_REQUIRED:
+        return cfg.status_snagged
     if pr.ci_state == CI_FAILED:
         return cfg.status_revising if pr.is_bot else cfg.status_snagged
     if reviewed and pr.approved:

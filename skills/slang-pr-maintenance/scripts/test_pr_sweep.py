@@ -148,6 +148,16 @@ class TestTargetStatus(unittest.TestCase):
     def test_bot_ci_failed_is_revising(self):
         self.assertEqual(self.t(is_bot=True, ci_state=common.CI_FAILED), "Revising")
 
+    def test_ci_action_required_is_snagged(self):
+        # Needs a maintainer to approve the CI run -> Snagged, for bot and human alike.
+        self.assertEqual(self.t(is_bot=False, ci_state=common.CI_ACTION_REQUIRED), "Snagged")
+        self.assertEqual(self.t(is_bot=True, ci_state=common.CI_ACTION_REQUIRED), "Snagged")
+
+    def test_changes_requested_still_wins_over_action_required(self):
+        # changes-requested ranks above the CI tier (the documented edge case).
+        self.assertEqual(
+            self.t(change_requested=True, ci_state=common.CI_ACTION_REQUIRED), "Revising")
+
     def test_approved_ci_pending_is_approved(self):
         self.assertEqual(self.t(approved=True, ci_state=common.CI_PENDING), "Approved")
 

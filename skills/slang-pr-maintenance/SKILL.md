@@ -149,16 +149,18 @@ variants that differ **only on a CI failure**:
   see/shepherd it. This + the board view IS the reviewer's "needs review" signal.
 - **Revising** — a **human draft**, or a reviewer requested changes (not yet
   superseded by a newer commit); a **Bot** PR's CI failure also lands here.
-- **Snagged** — needs a human: a **human** PR's CI failed, or an approved PR has
-  green CI but is **not** in the merge queue (a human must enqueue/merge it).
+- **Snagged** — needs a human: a **human** PR's CI failed, CI is awaiting a
+  maintainer's approval to run (`action_required`, e.g. a fork PR), or an approved
+  PR has green CI but is **not** in the merge queue (a human must enqueue/merge it).
 - **Approved** — not a draft, already approved, waiting on CI / the merge queue.
 - **Done** — the PR is closed (merged or otherwise); terminal.
 
 `target_status` priority (first match wins): a current changes-request →
-`Revising`; else draft → `In Review` (Bot) / `Revising` (human); else CI failed →
-`Revising` (Bot) / `Snagged` (human); else approved → `Snagged` if green &
-un-queued else `Approved`; else `In Review`. A review counts as "current" only if
-no commit landed after it (a newer commit makes it stale → `In Review`).
+`Revising`; else draft → `In Review` (Bot) / `Revising` (human); else CI
+`action_required` → `Snagged` (always); else CI failed → `Revising` (Bot) /
+`Snagged` (human); else approved → `Snagged` if green & un-queued else `Approved`;
+else `In Review`. A review counts as "current" only if no commit landed after it
+(a newer commit makes it stale → `In Review`).
 
 **Reconciliation (board vs reality).** The sweep does not special-case
 "contradictory" states: `reconcile` recomputes `target_status` from observed
